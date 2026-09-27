@@ -576,13 +576,22 @@ fn provider_params(
     if let Some(info_hash) = external_info_hash(request) {
         pairs.push(("info_hash".to_string(), info_hash.to_ascii_lowercase()));
     }
-    // The TVDB rung's id, season and episode travel as engine parameters; only
-    // the AniDB rung spells its filter here, because the engine has no
-    // `anime_id` parameter.
-    if rung == SearchRung::Anidb
-        && let Some(anidb_id) = external_anidb_id(request)
-    {
-        pairs.push(("anime_id".to_string(), anidb_id));
+    // The TVDB rung's id, season and episode travel as engine parameters. The
+    // AniDB and title rungs go through the raw search, which sends neither, so
+    // they spell the episode filter here; the AniDB rung adds `anime_id`, which
+    // the engine has no parameter for.
+    let spells_episode_filter = match rung {
+        SearchRung::Tvdb => false,
+        SearchRung::Anidb => match external_anidb_id(request) {
+            Some(anidb_id) => {
+                pairs.push(("anime_id".to_string(), anidb_id));
+                true
+            }
+            None => false,
+        },
+        SearchRung::Title => true,
+    };
+    if spells_episode_filter {
         if let Some(season) = request.season.and_then(i32_to_u32) {
             pairs.push(("season".to_string(), season.to_string()));
         }
@@ -749,7 +758,7 @@ fn candidate_for_link(
         AmenzbError::Message(format!("failed to encode ameNZB subtitle ref: {error}"))
     })?;
 
-    let mut match_hints = release_match_hints(request);
+    let mut match_hints = release_match_hints(request, release);
     match_hints.push(SubtitleMatchHint {
         kind: SubtitleMatchHintKind::Language,
         value: Some(link.language.clone()),
@@ -848,24 +857,60 @@ fn requested_languages(languages: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn release_match_hints(request: &SubtitlePluginSearchRequest) -> Vec<SubtitleMatchHint> {
-    vec![
-        SubtitleMatchHint {
-            kind: SubtitleMatchHintKind::ExternalId,
-            value: external_anidb_id(request).map(|value| format!("anidb:{value}")),
-        },
-        SubtitleMatchHint {
-            kind: SubtitleMatchHintKind::AbsoluteEpisode,
-            value: request.absolute_episode.map(|episode| episode.to_string()),
-        },
-        SubtitleMatchHint {
+/// Match hints backed by the release's own numbering.
+///
+/// ameNZB tags every item with `season` and `episode` attributes, and the host
+/// reads a `SeasonEpisode` hint as a full season-and-episode match. A search
+/// rung can still return other episodes (the title rung in particular), so an
+/// episode hint is only claimed when the release's attributes say so; a
+/// release without them gets none.
+fn release_match_hints(
+    request: &SubtitlePluginSearchRequest,
+    release: &SearchResult,
+) -> Vec<SubtitleMatchHint> {
+    let mut hints = vec![SubtitleMatchHint {
+        kind: SubtitleMatchHintKind::ExternalId,
+        value: external_anidb_id(request).map(|value| format!("anidb:{value}")),
+    }];
+    let release_season = release_number_attr(release, "season");
+    let release_episode = release_number_attr(release, "episode");
+    let requested_season = request.season.and_then(i32_to_u32);
+
+    if let (Some(season), Some(episode)) = (release_season, release_episode)
+        && requested_season == Some(season)
+        && request.episode.and_then(i32_to_u32) == Some(episode)
+    {
+        hints.push(SubtitleMatchHint {
             kind: SubtitleMatchHintKind::SeasonEpisode,
-            value: request
-                .season
-                .zip(request.episode)
-                .map(|(season, episode)| format!("S{season:02}E{episode:02}")),
-        },
-    ]
+            value: Some(format!("S{season:02}E{episode:02}")),
+        });
+    }
+
+    let season_agrees = match (release_season, requested_season) {
+        (Some(release), Some(requested)) => release == requested,
+        _ => true,
+    };
+    if let (Some(episode), Some(absolute)) = (
+        release_episode,
+        request.absolute_episode.and_then(i32_to_u32),
+    ) && episode == absolute
+        && season_agrees
+    {
+        hints.push(SubtitleMatchHint {
+            kind: SubtitleMatchHintKind::AbsoluteEpisode,
+            value: Some(absolute.to_string()),
+        });
+    }
+    hints
+}
+
+/// A numeric newznab attribute the metadata extractor kept, read leniently so
+/// `1`, `01` and `S01`/`E01` spellings all parse.
+fn release_number_attr(release: &SearchResult, key: &str) -> Option<u32> {
+    let raw = release.provider_extra.get(key)?.as_str()?.trim();
+    raw.trim_start_matches(|ch: char| ch.is_ascii_alphabetic())
+        .parse::<u32>()
+        .ok()
 }
 
 #[derive(Debug, Clone)]
@@ -1375,11 +1420,14 @@ fn external_tvdb_id(request: &SubtitlePluginSearchRequest) -> Option<String> {
     external_id(request, "tvdb").or_else(|| external_id(request, "tvdb_id"))
 }
 
+/// The episode number ameNZB filters on. Its `ep` reads the release's own
+/// TVDB-style episode attribute, so the season episode leads and the absolute
+/// number stands in only when the request has no season episode.
 fn requested_episode(request: &SubtitlePluginSearchRequest) -> Option<u32> {
     request
-        .absolute_episode
-        .or(request.episode)
+        .episode
         .and_then(i32_to_u32)
+        .or_else(|| request.absolute_episode.and_then(i32_to_u32))
 }
 
 fn external_info_hash(request: &SubtitlePluginSearchRequest) -> Option<String> {
@@ -1800,11 +1848,29 @@ mod tests {
     }
 
     #[test]
-    fn tvdb_rung_accepts_tvdb_id_key_and_sends_absolute_episode() {
+    fn id_rungs_prefer_season_episode_over_absolute_number() {
+        let mut request = request_with_both_ids();
+        request.season = Some(2);
+        request.episode = Some(1);
+        request.absolute_episode = Some(13);
+
+        let rungs = search_rungs(&amenzb_config(), &request);
+
+        assert_eq!(rungs[0].request.season, Some(2));
+        assert_eq!(rungs[0].request.episode, Some(1));
+        assert_eq!(
+            param(&rungs[1].additional_params, "ep").as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn tvdb_rung_accepts_tvdb_id_key_and_sends_absolute_only_without_episode() {
         let mut request = subtitle_request();
         request
             .external_ids
             .insert("tvdb_id".to_string(), vec!["900002".to_string()]);
+        request.episode = None;
         request.absolute_episode = Some(37);
 
         let rungs = search_rungs(&amenzb_config(), &request);
@@ -1849,6 +1915,124 @@ mod tests {
         assert!(title.request.ids.is_empty());
         assert!(!has_param(&title.additional_params, "anime_id"));
         assert!(!has_param(&title.additional_params, "tvdbid"));
+        assert_eq!(
+            param(&title.additional_params, "season").as_deref(),
+            Some("1")
+        );
+        assert_eq!(param(&title.additional_params, "ep").as_deref(), Some("12"));
+    }
+
+    #[test]
+    fn title_rung_omits_episode_filter_without_numbering() {
+        let mut request = subtitle_request();
+        request.season = None;
+        request.episode = None;
+
+        let rungs = search_rungs(&amenzb_config(), &request);
+
+        assert!(!has_param(&rungs[0].additional_params, "season"));
+        assert!(!has_param(&rungs[0].additional_params, "ep"));
+    }
+
+    fn numbered_release(season: Option<&str>, episode: Option<&str>) -> SearchResult {
+        let mut release = release("Synthetic Harbor Tales - numbered");
+        if let Some(season) = season {
+            release
+                .provider_extra
+                .insert("season".to_string(), json!(season));
+        }
+        if let Some(episode) = episode {
+            release
+                .provider_extra
+                .insert("episode".to_string(), json!(episode));
+        }
+        release
+    }
+
+    fn hint_value(hints: &[SubtitleMatchHint], kind: SubtitleMatchHintKind) -> Option<String> {
+        hints
+            .iter()
+            .find(|hint| hint.kind == kind)
+            .map(|hint| hint.value.clone().unwrap_or_default())
+    }
+
+    #[test]
+    fn release_with_matching_attrs_gets_season_episode_hint() {
+        let request = subtitle_request();
+
+        let hints = release_match_hints(&request, &numbered_release(Some("1"), Some("12")));
+
+        assert_eq!(
+            hint_value(&hints, SubtitleMatchHintKind::SeasonEpisode).as_deref(),
+            Some("S01E12")
+        );
+        assert_eq!(
+            hint_value(&hints, SubtitleMatchHintKind::AbsoluteEpisode),
+            None
+        );
+    }
+
+    #[test]
+    fn release_with_other_episode_attr_gets_no_episode_hint() {
+        let mut request = subtitle_request();
+        request.absolute_episode = Some(12);
+
+        let hints = release_match_hints(&request, &numbered_release(Some("1"), Some("3")));
+
+        assert_eq!(
+            hint_value(&hints, SubtitleMatchHintKind::SeasonEpisode),
+            None
+        );
+        assert_eq!(
+            hint_value(&hints, SubtitleMatchHintKind::AbsoluteEpisode),
+            None
+        );
+    }
+
+    #[test]
+    fn release_without_numbering_attrs_gets_no_episode_hint() {
+        let mut request = subtitle_request();
+        request.absolute_episode = Some(12);
+
+        let hints = release_match_hints(&request, &numbered_release(None, None));
+
+        assert_eq!(
+            hint_value(&hints, SubtitleMatchHintKind::SeasonEpisode),
+            None
+        );
+        assert_eq!(
+            hint_value(&hints, SubtitleMatchHintKind::AbsoluteEpisode),
+            None
+        );
+    }
+
+    #[test]
+    fn absolute_hint_needs_matching_episode_and_agreeing_season() {
+        let mut request = subtitle_request();
+        request.season = Some(2);
+        request.episode = Some(1);
+        request.absolute_episode = Some(13);
+
+        let agreeing = release_match_hints(&request, &numbered_release(Some("2"), Some("13")));
+        let unnumbered_season = release_match_hints(&request, &numbered_release(None, Some("13")));
+        let other_season = release_match_hints(&request, &numbered_release(Some("1"), Some("13")));
+
+        assert_eq!(
+            hint_value(&agreeing, SubtitleMatchHintKind::AbsoluteEpisode).as_deref(),
+            Some("13")
+        );
+        assert_eq!(
+            hint_value(&agreeing, SubtitleMatchHintKind::SeasonEpisode),
+            None
+        );
+        assert_eq!(
+            hint_value(&unnumbered_season, SubtitleMatchHintKind::AbsoluteEpisode).as_deref(),
+            Some("13")
+        );
+        assert_eq!(
+            hint_value(&other_season, SubtitleMatchHintKind::AbsoluteEpisode),
+            None
+        );
     }
 
     #[test]
