@@ -167,9 +167,15 @@ fn send_notification(req: &PluginNotificationRequest) -> FnResult<PluginNotifica
     } else {
         paths.iter().map(|path| Some(path.as_str())).collect()
     };
-    for path in lookups {
+    for (index, path) in lookups.into_iter().enumerate() {
         match refresh_targets(path, &section_types) {
             Ok(found) => {
+                // Only the first folder may fall back to refreshing every
+                // section. A moved title's old folder that no section holds
+                // has nothing in Plex to clean up.
+                if index > 0 && found.iter().all(|target| target.path.is_none()) {
+                    continue;
+                }
                 for target in found {
                     if !targets.iter().any(|known| {
                         known.section_id == target.section_id && known.path == target.path
