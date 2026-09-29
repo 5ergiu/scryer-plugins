@@ -51,6 +51,7 @@ const GUEST_SCRATCH_ROOT: &str = "/tmp";
 const RAR_PASSWORD: &str = "testpass123";
 const RAR4_HP_PASSWORD: &str = "secretpass";
 const SEVENZ_PASSWORD: &str = "sevenz-pass-42";
+const ZIP_PASSWORD: &str = "zip-pass-42";
 
 static AES_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CRC_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -71,8 +72,10 @@ fn archive_extraction_release_wasm_conforms_to_host_contract() {
     assert_sevenz_rejects_unsafe_paths(&wasm_path);
     assert_sevenz_rejects_duplicate_paths(&wasm_path);
     assert_encrypted_sevenz_uses_the_crypto_import(&wasm_path);
+    assert_data_only_encrypted_sevenz_password_states(&wasm_path);
     assert_xz_extracts(&wasm_path);
     assert_zip_extracts(&wasm_path);
+    assert_encrypted_zip_password_states(&wasm_path);
     assert_zip_path_escape_is_rejected(&wasm_path);
     assert_split_archives_are_joined(&wasm_path);
     assert_par2_repairs_a_damaged_archive_before_extracting(&wasm_path);
@@ -433,6 +436,78 @@ fn assert_zip_extracts(wasm_path: &Path) {
     assert_response_contains_file_bytes(&response, output.path(), b"hello from zip\n", "ZIP");
 }
 
+/// WinZip AES and ZipCrypto decrypt inside the guest (the zip crate's own
+/// ciphers), so this is the artifact's only proof that they were built in.
+fn assert_encrypted_zip_password_states(wasm_path: &Path) {
+    use zip::AesMode;
+    use zip::unstable::write::FileOptionsExt;
+
+    let payload = b"hello from encrypted zip\n";
+    for (label, mode) in [
+        ("AES-128", Some(AesMode::Aes128)),
+        ("AES-192", Some(AesMode::Aes192)),
+        ("AES-256", Some(AesMode::Aes256)),
+        ("ZipCrypto", None),
+    ] {
+        let source = tempfile::tempdir().expect("create encrypted ZIP source dir");
+        let file = fs::File::create(source.path().join("encrypted.zip"))
+            .expect("create encrypted ZIP fixture");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        let options = match mode {
+            Some(mode) => options.with_aes_encryption(mode, ZIP_PASSWORD),
+            None => options.with_deprecated_encryption(ZIP_PASSWORD.as_bytes()),
+        };
+        zip.start_file("secret.txt", options)
+            .expect("start encrypted ZIP entry");
+        zip.write_all(payload).expect("write encrypted ZIP payload");
+        zip.finish().expect("finish encrypted ZIP fixture");
+
+        for (password, expected) in [
+            (None, ArchivePluginStatus::PasswordRequired),
+            (
+                Some("not-the-password"),
+                ArchivePluginStatus::PasswordInvalid,
+            ),
+        ] {
+            let output = tempfile::tempdir().expect("create encrypted ZIP output dir");
+            let response = extract_archive(
+                wasm_path,
+                source.path(),
+                output.path(),
+                "encrypted.zip",
+                ArchivePluginFormat::Zip,
+                password,
+            );
+            assert_eq!(
+                response.status, expected,
+                "{label} ZIP with {password:?}: {:?}",
+                response.message
+            );
+            assert!(response.files.is_empty());
+            assert!(!output.path().join("secret.txt").exists());
+        }
+
+        let output = tempfile::tempdir().expect("create encrypted ZIP output dir");
+        let response = extract_archive(
+            wasm_path,
+            source.path(),
+            output.path(),
+            "encrypted.zip",
+            ArchivePluginFormat::Zip,
+            Some(ZIP_PASSWORD),
+        );
+        assert_eq!(
+            response.status,
+            ArchivePluginStatus::Ok,
+            "{label} ZIP: {:?}",
+            response.message
+        );
+        assert_response_contains_file_bytes(&response, output.path(), payload, label);
+    }
+}
+
 fn assert_zip_path_escape_is_rejected(wasm_path: &Path) {
     let source = tempfile::tempdir().expect("create unsafe ZIP source dir");
     let output = tempfile::tempdir().expect("create unsafe ZIP output dir");
@@ -657,11 +732,13 @@ fn assert_encrypted_sevenz_uses_the_crypto_import(wasm_path: &Path) {
         ArchivePluginFormat::SevenZip,
         Some("not-the-password"),
     );
-    assert_ne!(
+    assert_eq!(
         wrong.status,
-        ArchivePluginStatus::Ok,
-        "encrypted 7z extracted with the wrong password"
+        ArchivePluginStatus::PasswordInvalid,
+        "encrypted 7z with the wrong password: {:?}",
+        wrong.message
     );
+    assert!(wrong.files.is_empty());
 
     let before = host_call_counts();
     let output = tempfile::tempdir().expect("create encrypted 7z output dir");
@@ -686,6 +763,64 @@ fn assert_encrypted_sevenz_uses_the_crypto_import(wasm_path: &Path) {
         after.aes > before.aes,
         "encrypted 7z did not call the crypto aes-cbc-decrypt import"
     );
+}
+
+/// The data encrypted behind a plain header: the entry list reads without a
+/// key, so only the data's failure to decode tells a wrong key apart, and
+/// nothing may be listed or left behind for it.
+fn assert_data_only_encrypted_sevenz_password_states(wasm_path: &Path) {
+    let archive = "data-only.7z";
+    let payload = b"hello from data-only encrypted 7z\n";
+    let source = tempfile::tempdir().expect("create data-only 7z source dir");
+    create_encrypted_sevenz_fixture_with_header(
+        &source.path().join(archive),
+        "secret.txt",
+        payload,
+        SEVENZ_PASSWORD,
+        false,
+    );
+
+    for (password, expected) in [
+        (None, ArchivePluginStatus::PasswordRequired),
+        (
+            Some("not-the-password"),
+            ArchivePluginStatus::PasswordInvalid,
+        ),
+    ] {
+        let output = tempfile::tempdir().expect("create data-only 7z output dir");
+        let response = extract_archive(
+            wasm_path,
+            source.path(),
+            output.path(),
+            archive,
+            ArchivePluginFormat::SevenZip,
+            password,
+        );
+        assert_eq!(
+            response.status, expected,
+            "data-only 7z with {password:?}: {:?}",
+            response.message
+        );
+        assert!(response.files.is_empty());
+        assert!(!output.path().join("secret.txt").exists());
+    }
+
+    let output = tempfile::tempdir().expect("create data-only 7z output dir");
+    let response = extract_archive(
+        wasm_path,
+        source.path(),
+        output.path(),
+        archive,
+        ArchivePluginFormat::SevenZip,
+        Some(SEVENZ_PASSWORD),
+    );
+    assert_eq!(
+        response.status,
+        ArchivePluginStatus::Ok,
+        "data-only 7z: {:?}",
+        response.message
+    );
+    assert_response_contains_file_bytes(&response, output.path(), payload, "data-only 7z");
 }
 
 fn assert_sevenz_rejects_duplicate_paths(wasm_path: &Path) {
@@ -1246,6 +1381,17 @@ fn create_sevenz_fixture_with_entries(path: &Path, entries: &[(&str, &[u8])]) {
 
 /// An AES-256 + LZMA2 7z with an encrypted header, as `7z a -p -mhe=on` makes.
 fn create_encrypted_sevenz_fixture(path: &Path, entry_name: &str, payload: &[u8], password: &str) {
+    create_encrypted_sevenz_fixture_with_header(path, entry_name, payload, password, true);
+}
+
+/// `encrypt_header: false` is `7z a -p -mhe=off`: the entry list stays readable.
+fn create_encrypted_sevenz_fixture_with_header(
+    path: &Path,
+    entry_name: &str,
+    payload: &[u8],
+    password: &str,
+    encrypt_header: bool,
+) {
     use sevenz_turbo::encoder_options::{AesEncoderOptions, Lzma2Options};
 
     let mut archive = sevenz_turbo::ArchiveWriter::create(path).expect("create encrypted 7z");
@@ -1253,6 +1399,7 @@ fn create_encrypted_sevenz_fixture(path: &Path, entry_name: &str, payload: &[u8]
         AesEncoderOptions::new(sevenz_turbo::Password::new(password)).into(),
         Lzma2Options::default().into(),
     ]);
+    archive.set_encrypt_header(encrypt_header);
     archive
         .push_archive_entry(
             sevenz_turbo::ArchiveEntry::new_file(entry_name),
