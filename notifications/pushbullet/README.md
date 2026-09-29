@@ -1,18 +1,68 @@
 # Pushbullet
 
-Create Pushbullet note pushes from Scryer event summaries. The plugin can address channels, specific devices, or the account default target.
+Sends Scryer notifications as [Pushbullet](https://www.pushbullet.com/) pushes: to channels you own, to specific devices, or to every device on your account.
+
+## Getting an access token
+
+1. Sign in at <https://www.pushbullet.com/> and open your Account Settings page (<https://www.pushbullet.com/#settings/account>).
+2. Create an access token in the **Access Tokens** section and copy it.
+3. Paste it into **Access Token** in Scryer's notification settings.
+
+Pushbullet's documentation warns that the token has full access to your account, so treat it like a password.
 
 ## Configuration
 
-| Setting | Required | Purpose |
-| --- | --- | --- |
-| **api_key** | Yes | Pushbullet access token. |
-| **channel_tags** | No | One or more channel tags. These take priority over device targets. |
-| **device_ids** | No | Device identifiers, separated by commas, semicolons, or newlines. Numeric values are sent as device IDs; other values as device idens. |
-| **sender_id** | No | Source device identifier sent as source_device_iden. |
+| Setting | Key | Required | Purpose |
+| --- | --- | --- | --- |
+| **Access Token** | `api_key` | Yes | Your Pushbullet access token. |
+| **Device IDs** | `device_ids` | No | Device idens to push to, one push per device. Separate entries with commas, semicolons or new lines. |
+| **Channel Tags** | `channel_tags` | No | Tags of channels your account owns, one push per channel. When set, **Device IDs** is ignored. |
+| **Sender ID** | `sender_id` | No | The iden of the device the pushes are sent from (Pushbullet's `source_device_iden`). Leave empty to send from the account. A **Test** warns if it is not one of your active devices. |
+| **Include App Name In Title** | `include_app_name_in_title` | No | Prefixes the push title with the application name, as in "Scryer - Grabbed: Example Show". Off by default. |
+| **Metadata Link** | `metadata_link` | No | The site a push opens when tapped: `auto` (default) picks the best id the title carries, `none` sends plain notes, or pick one of IMDb, TVDb, TVMaze, Trakt, TMDb, AniDB, AniList, MyAnimeList, Kitsu. |
 
-## Targeting and setup help
+Settings saved by earlier versions of this plugin (0.1.x, 0.2.0) load unchanged; every key is the same.
 
-When channel tags are present, the plugin sends one push to each channel and ignores **device_ids**. Otherwise it sends one push per device; with neither setting, Pushbullet chooses the default target for the access token.
+### Finding device idens
 
-Scryer can invoke the plugin’s **getDevices** action to list available devices after an access token is configured. The send payload is always a Pushbullet note with the Scryer summary title and message; files and links are not attached.
+A device iden is an identifier such as `ujpah72o0sjAoRtnM0jc`, not the device's name. Enter what you think is right and run **Test**: if an entry is not one of your active devices, the test fails and lists every device on the account as `name (iden)`. If you entered a device's name instead of its iden, the error tells you the iden to use.
+
+Earlier versions sent an all-digit entry as a numeric `device_id`. The Pushbullet API does not document that parameter, so every entry is now sent as a `device_iden`. A **Test** reports an all-digit entry that does not match a device.
+
+## Routing
+
+Pushbullet allows exactly one target per push, so:
+
+- With **Channel Tags** set, the plugin sends one push to each channel. **Device IDs** is ignored, and a **Test** warns you if both are set.
+- Otherwise, with **Device IDs** set, it sends one push to each device.
+- With neither set, it sends a single push with no target. Pushbullet delivers that to every device on the account.
+
+Each push reports its own result. If one device or channel fails, the others are still sent, and Scryer is told which target failed and why. A rejected token, the monthly quota (below), a rate limit or an unreachable Pushbullet affects every push the same way, so the plugin stops at the first one. It reports the targets it did not try as `not_attempted`.
+
+A push is a **link** that opens the title's metadata page, or the Scryer page for events that need your attention. With no link available, or with **Metadata Link** set to `none`, it is a plain **note**.
+
+## Errors
+
+| What Pushbullet says | What Scryer is told |
+| --- | --- |
+| The token is missing or invalid (HTTP 401) | Authentication failed on **Access Token**. |
+| A channel is refused (HTTP 403 on a channel push) | Invalid configuration on **Channel Tags**. The channel must exist and be owned by the token's account. |
+| A device or channel is unknown | Invalid configuration on **Device IDs** or **Channel Tags**, naming the entry. |
+| The sender device is rejected | Invalid configuration on **Sender ID**. |
+| Rate limited (HTTP 429) | A failed delivery, with the time until Pushbullet's `X-Ratelimit-Reset` as the retry delay. |
+| Server error (HTTP 5xx) | A failed delivery for that target, which may be retried. |
+| The monthly push quota is used up | Rate limited, with the message below. |
+
+When Pushbullet's request budget is nearly spent (`X-Ratelimit-Remaining` at 5% or less of `X-Ratelimit-Limit`), a successful push carries a warning. That budget is Pushbullet's short-term request rate limit, not the monthly push quota.
+
+## The free-account monthly quota
+
+Pushbullet limits accounts without a [Pushbullet Pro](https://www.pushbullet.com/pro) subscription to **500 pushes a month** sent through the API. Each device and each channel push counts separately, so an event sent to three devices uses three pushes.
+
+When the quota is used up, Pushbullet refuses every further push with "Pushbullet Pro is required to make this call." The plugin recognises that answer and reports: "Pushbullet's monthly push limit is reached". The error is typed as rate limited rather than a generic failure, and the plugin stops sending to the remaining targets. If some pushes for the event went out before the limit was hit, the delivery is reported as partly failed, with each target's result.
+
+Pushbullet does not expose the remaining quota or its reset date through the API, so the plugin cannot warn before the quota runs out or say when it will reset. Pushes work again when the quota resets or the account is upgraded to Pro. To make the quota last longer, route to one channel or device rather than several, or turn off the event types you do not need.
+
+## Status
+
+Pushbullet's service and API still work, but the product has received little development since 2022. Its API documentation was last updated in June 2020.
