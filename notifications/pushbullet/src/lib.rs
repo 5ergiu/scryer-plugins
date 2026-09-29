@@ -406,6 +406,7 @@ fn body(req: &PluginNotificationRequest, settings: &Settings) -> String {
 /// Every line is conditional on its block being present, so the sparse request
 /// the core sends today renders just the summary.
 fn detail_lines(req: &PluginNotificationRequest) -> Vec<String> {
+    let summary = req.summary_message.as_str();
     let mut lines = Vec::new();
     match req.event_type {
         NotificationEventType::Grab => {
@@ -435,25 +436,25 @@ fn detail_lines(req: &PluginNotificationRequest) -> Vec<String> {
             push(&mut lines, "Release Group", release_group(req));
             push(&mut lines, "Size", size(req));
             push(&mut lines, "Client", client_name(req));
-            push(&mut lines, "Destination", import_path(req));
+            push_path(&mut lines, "Destination", import_path(req), summary);
         }
         NotificationEventType::ImportRejected => {
             push(&mut lines, "Episode", episode_display(req));
             push(&mut lines, "Release", release_title(req));
-            push(&mut lines, "Source", source_path(req));
+            push_path(&mut lines, "Source", source_path(req), summary);
             push(&mut lines, "Status", import_status(req));
         }
         NotificationEventType::Rename => {
             push(&mut lines, "Episode", episode_display(req));
-            push(&mut lines, "File", primary_path(req));
+            push_path(&mut lines, "File", primary_path(req), summary);
         }
         NotificationEventType::FileDeleted | NotificationEventType::FileDeletedForUpgrade => {
             push(&mut lines, "Episode", episode_display(req));
-            push(&mut lines, "File", deleted_path(req));
+            push_path(&mut lines, "File", deleted_path(req), summary);
             push(&mut lines, "Quality", quality(req));
         }
         NotificationEventType::TitleAdded | NotificationEventType::TitleDeleted => {
-            push(&mut lines, "Path", title_path(req));
+            push_path(&mut lines, "Path", title_path(req), summary);
         }
         NotificationEventType::HealthIssue | NotificationEventType::HealthRestored => {
             push(&mut lines, "Check", health_source(req));
@@ -475,7 +476,7 @@ fn detail_lines(req: &PluginNotificationRequest) -> Vec<String> {
         }
         NotificationEventType::SubtitleDownloaded | NotificationEventType::SubtitleSearchFailed => {
             push(&mut lines, "Episode", episode_display(req));
-            push(&mut lines, "File", primary_path(req));
+            push_path(&mut lines, "File", primary_path(req), summary);
             push(&mut lines, "Languages", subtitle_languages(req));
         }
         NotificationEventType::MediaRequestSubmitted
@@ -486,8 +487,8 @@ fn detail_lines(req: &PluginNotificationRequest) -> Vec<String> {
             push(&mut lines, "Quality Profile", media_request_profile(req));
         }
         NotificationEventType::TitleMoved => {
-            push(&mut lines, "From", title_move_source(req));
-            push(&mut lines, "To", title_move_destination(req));
+            push_path(&mut lines, "From", title_move_source(req), summary);
+            push_path(&mut lines, "To", title_move_destination(req), summary);
             push(&mut lines, "Warning", title_move_warning(req));
         }
         // Not in `supported_events`, so the host never routes them here; the
@@ -505,6 +506,19 @@ fn detail_lines(req: &PluginNotificationRequest) -> Vec<String> {
 
 fn push(lines: &mut Vec<String>, label: &str, value: Option<String>) {
     if let Some(value) = non_empty(value) {
+        lines.push(format!("{label}: {value}"));
+    }
+}
+
+/// A path the summary already names is not repeated: the dispatcher writes the
+/// deleted file's path and a moved title's destination into `summary_message`,
+/// and a phone shows only the first few lines of a push. Only the path lines
+/// (and the library a move falls back to) are matched this way, so a short
+/// value such as a quality is never dropped for appearing inside a longer word.
+fn push_path(lines: &mut Vec<String>, label: &str, value: Option<String>, summary: &str) {
+    if let Some(value) = non_empty(value)
+        && !summary.contains(value.as_str())
+    {
         lines.push(format!("{label}: {value}"));
     }
 }

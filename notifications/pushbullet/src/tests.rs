@@ -411,6 +411,60 @@ fn a_title_move_renders_its_origin_destination_and_warning() {
 }
 
 #[test]
+fn a_deleted_file_path_the_summary_already_names_is_not_repeated() {
+    let mut req = request(NotificationEventType::FileDeleted);
+    req.summary_title = "File deleted: Example Show".to_string();
+    req.summary_message =
+        "Deleted media file from disk: /media/a/Example Show/S01E01.mkv".to_string();
+    req.release = Some(scryer_plugin_sdk::PluginNotificationRelease {
+        quality: Some("WEBDL-1080p".to_string()),
+        ..Default::default()
+    });
+    req.file = Some(scryer_plugin_sdk::PluginNotificationFile {
+        primary_path: None,
+        media_updates: vec![scryer_plugin_sdk::PluginNotificationMediaUpdate {
+            path: "/media/a/Example Show/S01E01.mkv".to_string(),
+            update_type: scryer_plugin_sdk::NotificationMediaUpdateType::Deleted,
+        }],
+    });
+    let (_, sent) = run(&req, &settings(), vec![pushed("push-1")]);
+    let text = body_of(&sent[0])["body"]
+        .as_str()
+        .expect("the push has a body")
+        .to_string();
+    assert_eq!(
+        text.matches("/media/a/Example Show/S01E01.mkv").count(),
+        1,
+        "{text}"
+    );
+    assert!(!text.contains("File:"), "{text}");
+    assert!(text.contains("Quality: WEBDL-1080p"), "{text}");
+}
+
+#[test]
+fn a_move_destination_the_summary_already_names_is_not_repeated() {
+    let mut req = request(NotificationEventType::TitleMoved);
+    req.summary_title = "Moved: Example Show".to_string();
+    req.summary_message =
+        "Moved 'Example Show' from Library A to Library B (/media/b/Example Show).".to_string();
+    req.title_move = Some(PluginNotificationTitleMove {
+        source_library_name: Some("Library A".to_string()),
+        destination_library_name: Some("Library B".to_string()),
+        source_path: Some("/media/a/Example Show".to_string()),
+        destination_path: Some("/media/b/Example Show".to_string()),
+        ..PluginNotificationTitleMove::default()
+    });
+    let (_, sent) = run(&req, &settings(), vec![pushed("push-1")]);
+    let text = body_of(&sent[0])["body"]
+        .as_str()
+        .expect("the push has a body")
+        .to_string();
+    assert!(text.contains("From: /media/a/Example Show"), "{text}");
+    assert!(!text.contains("To:"), "{text}");
+    assert_eq!(text.matches("/media/b/Example Show").count(), 1, "{text}");
+}
+
+#[test]
 fn a_title_with_a_metadata_id_becomes_a_link_push_unless_links_are_off() {
     let mut req = live();
     req.title = Some(series_title());
