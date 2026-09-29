@@ -479,6 +479,7 @@ fn base_search_request(
         absolute_episode: request.absolute_episode.and_then(i32_to_u32),
         tagged_aliases: vec![],
         context: None,
+        rss_catch_up: None,
     }
 }
 
