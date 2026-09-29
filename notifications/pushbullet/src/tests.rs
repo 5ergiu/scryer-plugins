@@ -130,6 +130,12 @@ fn api_error(message: &str, param: Option<&str>) -> String {
     json!({ "error": error }).to_string()
 }
 
+/// Rejections exactly as the live API words them: an unknown or unowned target
+/// is a 400 `invalid_param` naming the parameter.
+const DEVICE_REJECTED: &str = "The param 'device_iden' has an invalid value.";
+const CHANNEL_REJECTED: &str = "The param 'channel_tag' has an invalid value.";
+const SENDER_REJECTED: &str = "The param 'source_device_iden' has an invalid value.";
+
 /// The Pro-required error exactly as the live API has returned it. The same
 /// code answers every Pro-gated limit; for a note or link push that is the
 /// monthly push quota.
@@ -565,10 +571,7 @@ fn a_rejected_device_is_invalid_config_on_device_ids() {
     let (result, _) = run(
         &live(),
         &settings,
-        vec![reply(
-            400,
-            &api_error("Device not found.", Some("device_iden")),
-        )],
+        vec![reply(400, &api_error(DEVICE_REJECTED, Some("device_iden")))],
     );
     let error = err(result);
     assert_eq!(error.code, PluginErrorCode::InvalidConfig);
@@ -584,6 +587,19 @@ fn a_refused_channel_is_invalid_config_on_channel_tags_but_a_refused_broadcast_i
         vec![reply(
             403,
             &api_error("The access token is not valid for that request.", None),
+        )],
+    );
+    let error = err(result);
+    assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+    assert!(error.public_message.contains("channel_tags"), "{error:?}");
+
+    // What the live API answers for a channel this account does not own.
+    let (result, _) = run(
+        &live(),
+        &with_channels(&["borrowed-channel"]),
+        vec![reply(
+            400,
+            &api_error(CHANNEL_REJECTED, Some("channel_tag")),
         )],
     );
     let error = err(result);
@@ -614,12 +630,31 @@ fn a_rejected_sender_is_invalid_config_on_sender_id() {
         &settings,
         vec![reply(
             400,
-            &api_error("Invalid source device.", Some("source_device_iden")),
+            &api_error(SENDER_REJECTED, Some("source_device_iden")),
         )],
     );
     let error = err(result);
     assert_eq!(error.code, PluginErrorCode::InvalidConfig);
     assert!(error.public_message.contains("sender_id"), "{error:?}");
+
+    // The parameter name contains "device", so a device push must still blame
+    // the sender rather than the device.
+    let settings = Settings {
+        sender: Some("unot-mine".to_string()),
+        ..with_devices(&["udevone"])
+    };
+    let (result, _) = run(
+        &live(),
+        &settings,
+        vec![reply(
+            400,
+            &api_error(SENDER_REJECTED, Some("source_device_iden")),
+        )],
+    );
+    let error = err(result);
+    assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+    assert!(error.public_message.contains("sender_id"), "{error:?}");
+    assert!(!error.public_message.contains("device_ids"), "{error:?}");
 }
 
 #[test]
@@ -630,7 +665,7 @@ fn one_bad_device_among_good_ones_is_a_partial_failure_with_per_target_results()
         &settings,
         vec![
             pushed("push-1"),
-            reply(400, &api_error("Device not found.", Some("device_iden"))),
+            reply(400, &api_error(DEVICE_REJECTED, Some("device_iden"))),
             pushed("push-3"),
         ],
     );

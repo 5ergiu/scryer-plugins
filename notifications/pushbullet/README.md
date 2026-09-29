@@ -27,7 +27,7 @@ Settings saved by earlier versions of this plugin (0.1.x, 0.2.0) load unchanged;
 
 A device iden is an identifier such as `ujpah72o0sjAoRtnM0jc`, not the device's name. Enter what you think is right and run **Test**: if an entry is not one of your active devices, the test fails and lists every device on the account as `name (iden)`. If you entered a device's name instead of its iden, the error tells you the iden to use.
 
-Earlier versions sent an all-digit entry as a numeric `device_id`. The Pushbullet API does not document that parameter, so every entry is now sent as a `device_iden`. A **Test** reports an all-digit entry that does not match a device.
+Earlier versions sent an all-digit entry as a numeric `device_id`. The Pushbullet API does not document that parameter and ignores it, sending the push to every device instead, so every entry is now sent as a `device_iden`. A **Test** reports an all-digit entry that does not match a device.
 
 ## Routing
 
@@ -48,8 +48,8 @@ A push is a **link** that opens the title's metadata page, or the Scryer page fo
 | What Pushbullet says | What Scryer is told |
 | --- | --- |
 | The token is missing or invalid (HTTP 401) | Authentication failed on **Access Token**. |
-| A channel is refused (HTTP 403 on a channel push) | Invalid configuration on **Channel Tags**. The channel must exist and be owned by the token's account. |
-| A device or channel is unknown | Invalid configuration on **Device IDs** or **Channel Tags**, naming the entry. |
+| A device or channel is unknown, or the channel is not the token account's own (HTTP 400 naming `device_iden` or `channel_tag`) | Invalid configuration on **Device IDs** or **Channel Tags**, naming the entry. |
+| A channel push is forbidden (HTTP 403) | Invalid configuration on **Channel Tags**. |
 | The sender device is rejected | Invalid configuration on **Sender ID**. |
 | Rate limited (HTTP 429) | A failed delivery, with the time until Pushbullet's `X-Ratelimit-Reset` as the retry delay. |
 | Server error (HTTP 5xx) | A failed delivery for that target, which may be retried. |

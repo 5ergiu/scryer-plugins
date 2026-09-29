@@ -345,8 +345,8 @@ impl Target {
 ///
 /// Every device entry is sent as `device_iden`. Sonarr and the 0.1.x plugin
 /// sent an all-digit value as `device_id`, a parameter the API does not
-/// document; with a JSON body an unknown parameter is at best ignored, which
-/// would turn a targeted push into a broadcast.
+/// document. The live API ignores it and sends the push to every device, so
+/// a targeted push would silently become a broadcast.
 fn targets(settings: &Settings) -> Vec<Target> {
     if !settings.channels.is_empty() {
         return settings
@@ -1194,8 +1194,9 @@ fn classify_push(target: &Target, reply: &Reply, now: Option<i64>) -> Outcome {
     match status {
         // "No valid access token provided".
         401 => Outcome::Fatal(token_rejected(&detail)),
-        // "The access token is not valid for that request". For a channel push
-        // that is the documented "the current user must own this channel";
+        // "The access token is not valid for that request". The live API
+        // answers an unowned channel with a 400 naming `channel_tag` (handled
+        // below); a 403 on a channel push is still read as the channel, and
         // anywhere else it is the token.
         403 => match target {
             Target::Channel(tag) => Outcome::Misconfigured(plugin_error(
