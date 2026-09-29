@@ -485,7 +485,20 @@ fn detail_lines(req: &PluginNotificationRequest) -> Vec<String> {
             push(&mut lines, "Status", media_request_status(req));
             push(&mut lines, "Quality Profile", media_request_profile(req));
         }
-        NotificationEventType::Test => {}
+        NotificationEventType::TitleMoved => {
+            push(&mut lines, "From", title_move_source(req));
+            push(&mut lines, "To", title_move_destination(req));
+            push(&mut lines, "Warning", title_move_warning(req));
+        }
+        // Not in `supported_events`, so the host never routes them here; the
+        // summary lines are all such a notification would carry.
+        NotificationEventType::ListTitleAdded
+        | NotificationEventType::ListRequestSubmitted
+        | NotificationEventType::ListItemHeld
+        | NotificationEventType::ListTitleLeft
+        | NotificationEventType::ListSyncFailed
+        | NotificationEventType::ListUnfollowed
+        | NotificationEventType::Test => {}
     }
     lines
 }

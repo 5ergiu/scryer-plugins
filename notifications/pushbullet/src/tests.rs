@@ -1,7 +1,7 @@
 use super::*;
 use scryer_plugin_sdk::{
     NotificationSeverity, PluginNotificationApp, PluginNotificationExternalIds,
-    PluginNotificationManualInteraction, PluginNotificationTitle,
+    PluginNotificationManualInteraction, PluginNotificationTitle, PluginNotificationTitleMove,
 };
 
 /// A fixed "now" so reset arithmetic never depends on the clock.
@@ -61,6 +61,7 @@ fn request(event_type: NotificationEventType) -> PluginNotificationRequest {
         application_update: None,
         manual_interaction: None,
         media_request: None,
+        title_move: None,
     }
 }
 
@@ -380,6 +381,33 @@ fn the_app_name_prefix_is_opt_in_and_never_doubled() {
     let mut untitled = live();
     untitled.summary_title = String::new();
     assert_eq!(heading(&untitled, &branded), "Scryer");
+}
+
+#[test]
+fn a_title_move_renders_its_origin_destination_and_warning() {
+    assert!(general_notification_events().contains(&NotificationEventType::TitleMoved));
+    let mut req = request(NotificationEventType::TitleMoved);
+    req.summary_title = "Moved: Example Show".to_string();
+    req.summary_message = "Moved 'Example Show' from Library A to Library B.".to_string();
+    req.title_move = Some(PluginNotificationTitleMove {
+        source_library_name: Some("Library A".to_string()),
+        destination_library_name: Some("Library B".to_string()),
+        source_path: Some("/media/a/Example Show".to_string()),
+        destination_path: Some("/media/b/Example Show".to_string()),
+        completed_with_warnings: true,
+        detail: Some("the source folder could not be removed".to_string()),
+        ..PluginNotificationTitleMove::default()
+    });
+
+    let (_, sent) = run(&req, &settings(), vec![pushed("push-1")]);
+    let body = body_of(&sent[0]);
+    let text = body["body"].as_str().expect("the push has a body");
+    assert!(text.contains("From: /media/a/Example Show"), "{text}");
+    assert!(text.contains("To: /media/b/Example Show"), "{text}");
+    assert!(
+        text.contains("Warning: the source folder could not be removed"),
+        "{text}"
+    );
 }
 
 #[test]
