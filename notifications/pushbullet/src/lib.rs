@@ -919,11 +919,6 @@ fn external_id(
 // ---------------------------------------------------------------------------
 
 /// The JSON body of one `POST /v2/pushes`.
-///
-/// No `guid` is sent. The docs offer it for de-duplicating a retried push, but
-/// Scryer's core does not re-send the same push with a stable id, and a guid
-/// shared across the per-channel pushes of one event would risk Pushbullet
-/// treating the second channel's push as a duplicate of the first.
 fn push_payload(req: &PluginNotificationRequest, settings: &Settings, target: &Target) -> Value {
     let mut payload = Map::new();
     let link = push_link(req, settings);
@@ -949,7 +944,35 @@ fn push_payload(req: &PluginNotificationRequest, settings: &Settings, target: &T
             Value::String(sender.clone()),
         );
     }
+    if let Some(guid) = push_guid(req, target) {
+        payload.insert("guid".to_string(), Value::String(guid));
+    }
     Value::Object(payload)
+}
+
+/// Pushbullet documents that "pushes with guid set are mostly idempotent":
+/// a second push with the same guid returns the first instead of creating
+/// another. Scryer re-sends a disk-space notification to a channel until the
+/// whole send succeeds, so without a guid one failing device would re-deliver
+/// the event to every device that already had it on each retry.
+///
+/// The guid is derived from the event and the target, so a retry of the same
+/// event to the same target repeats it while each device or channel of one
+/// event, and every other event, gets its own. A Test has no event id and
+/// sends none.
+fn push_guid(req: &PluginNotificationRequest, target: &Target) -> Option<String> {
+    let event_id = non_empty(req.event_id.clone())?;
+    // FNV-1a: stable across builds and platforms, unlike `DefaultHasher`.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in event_id
+        .bytes()
+        .chain(std::iter::once(0))
+        .chain(target.label().bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(format!("scryer-{hash:016x}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,7 +1124,7 @@ fn quota_error(detail: &str) -> PluginError {
     plugin_error(
         PluginErrorCode::RateLimited,
         format!(
-            "Pushbullet's monthly push limit is reached: accounts without Pushbullet Pro may send {FREE_MONTHLY_PUSHES} pushes a month, and Pushbullet refuses every push after that until the limit resets or the account is upgraded ({detail})"
+            "Pushbullet refused the push because it needs Pushbullet Pro. For a note or link push that is the free monthly push limit: accounts without Pro may send {FREE_MONTHLY_PUSHES} pushes a month, and pushes work again when the limit resets or the account is upgraded ({detail})"
         ),
         Some(format!("{QUOTA_ERROR_CODE}: {detail}")),
     )

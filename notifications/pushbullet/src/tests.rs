@@ -130,7 +130,9 @@ fn api_error(message: &str, param: Option<&str>) -> String {
     json!({ "error": error }).to_string()
 }
 
-/// The monthly quota error exactly as the live API has returned it.
+/// The Pro-required error exactly as the live API has returned it. The same
+/// code answers every Pro-gated limit; for a note or link push that is the
+/// monthly push quota.
 const QUOTA_BODY: &str = r#"{"error":{"code":"pushbullet_pro_required","type":"invalid_request","message":"Pushbullet Pro is required to make this call.","cat":"~(=^‥^)ノ"},"error_code":"pushbullet_pro_required"}"#;
 
 /// Runs one delivery against scripted replies, returning the result and every
@@ -348,6 +350,43 @@ fn channels_take_priority_and_each_gets_its_own_push_and_result() {
             ("channel:alpha-channel", true),
             ("channel:beta-channel", true)
         ]
+    );
+}
+
+#[test]
+fn a_retried_event_repeats_each_targets_guid_so_pushbullet_does_not_duplicate_it() {
+    let settings = with_devices(&["udevone", "udevtwo"]);
+    let mut req = live();
+    req.event_id = Some("evt-synthetic-1".to_string());
+    let guids = |sent: &[Outbound]| -> Vec<String> {
+        sent.iter()
+            .map(|push| {
+                body_of(push)["guid"]
+                    .as_str()
+                    .expect("an event push carries a guid")
+                    .to_string()
+            })
+            .collect()
+    };
+
+    // The second device fails, so the core sends the whole event again.
+    let (_, first) = run(&req, &settings, vec![pushed("push-1"), reply(502, "")]);
+    let (_, retry) = run(&req, &settings, vec![pushed("push-1"), pushed("push-2")]);
+    let first = guids(&first);
+    assert_eq!(first, guids(&retry));
+    assert_ne!(first[0], first[1], "each target has its own guid");
+
+    req.event_id = Some("evt-synthetic-2".to_string());
+    let (_, other) = run(&req, &settings, vec![pushed("push-3"), pushed("push-4")]);
+    let other = guids(&other);
+    assert!(other.iter().all(|guid| !first.contains(guid)), "{other:?}");
+
+    req.event_id = None;
+    let (_, anonymous) = run(&req, &settings, vec![pushed("push-5"), pushed("push-6")]);
+    assert!(
+        anonymous
+            .iter()
+            .all(|push| body_of(push).get("guid").is_none())
     );
 }
 

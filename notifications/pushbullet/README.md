@@ -39,6 +39,8 @@ Pushbullet allows exactly one target per push, so:
 
 Each push reports its own result. If one device or channel fails, the others are still sent, and Scryer is told which target failed and why. A rejected token, the monthly quota (below), a rate limit or an unreachable Pushbullet affects every push the same way, so the plugin stops at the first one. It reports the targets it did not try as `not_attempted`.
 
+Every push for an event carries a `guid` derived from the event and the target. When Scryer sends an event again after a partial failure, Pushbullet returns the push that already went out instead of delivering it again. Pushbullet describes this as "mostly idempotent", so a rare duplicate is still possible.
+
 A push is a **link** that opens the title's metadata page, or the Scryer page for events that need your attention. With no link available, or with **Metadata Link** set to `none`, it is a plain **note**.
 
 ## Errors
@@ -59,7 +61,7 @@ When Pushbullet's request budget is nearly spent (`X-Ratelimit-Remaining` at 5% 
 
 Pushbullet limits accounts without a [Pushbullet Pro](https://www.pushbullet.com/pro) subscription to **500 pushes a month** sent through the API. Each device and each channel push counts separately, so an event sent to three devices uses three pushes.
 
-When the quota is used up, Pushbullet refuses every further push with "Pushbullet Pro is required to make this call." The plugin recognises that answer and reports: "Pushbullet's monthly push limit is reached". The error is typed as rate limited rather than a generic failure, and the plugin stops sending to the remaining targets. If some pushes for the event went out before the limit was hit, the delivery is reported as partly failed, with each target's result.
+When the quota is used up, Pushbullet refuses every further push with "Pushbullet Pro is required to make this call." (error code `pushbullet_pro_required`). Pushbullet uses the same answer for every Pro-only limit, such as file storage, but this plugin sends only note and link pushes, so for it the answer means the monthly quota. The plugin reports that the push needs Pushbullet Pro and names the free monthly limit. The error is typed as rate limited rather than a generic failure, and the plugin stops sending to the remaining targets. If some pushes for the event went out before the limit was hit, the delivery is reported as partly failed, with each target's result.
 
 Pushbullet does not expose the remaining quota or its reset date through the API, so the plugin cannot warn before the quota runs out or say when it will reset. Pushes work again when the quota resets or the account is upgraded to Pro. To make the quota last longer, route to one channel or device rather than several, or turn off the event types you do not need.
 
