@@ -441,11 +441,12 @@ fn open_rar_archive(
 
     match password.filter(|password| !password.is_empty()) {
         Some(password) => RarArchive::open_with_password(archive_file, password).map_err(|error| {
-            Box::new(rar_error_response(
-                "open_rar",
-                "failed to read RAR archive",
-                error,
-            ))
+            let wrong_key = is_wrong_key_symptom(&error) && rar_headers_are_encrypted(archive_path);
+            let mut response = rar_error_response("open_rar", "failed to read RAR archive", error);
+            if wrong_key {
+                response.status = ArchivePluginStatus::PasswordInvalid;
+            }
+            Box::new(response)
         }),
         None => RarArchive::open(archive_file).map_err(|error| {
             Box::new(rar_error_response(
@@ -455,6 +456,37 @@ fn open_rar_archive(
             ))
         }),
     }
+}
+
+/// Whether the archive's headers are encrypted, asked by opening it without
+/// a password: that refuses a header-encrypted archive up front, where a
+/// wrong password only surfaces as headers that decrypt to garbage.
+fn rar_headers_are_encrypted(archive_path: &Path) -> bool {
+    fs::File::open(archive_path)
+        .is_ok_and(|file| matches!(RarArchive::open(file), Err(RarError::EncryptedArchive)))
+}
+
+/// The failures a wrong key produces on encrypted RAR data.
+///
+/// RAR5 checks the password against a stored check value and says so
+/// directly. RAR4 stores none: a wrong key decrypts to garbage that fails a
+/// header CRC, a data CRC, or the decompressor's own sanity checks. Only
+/// meaningful once it is known that a password was supplied and that what
+/// failed was encrypted — on plain data these are ordinary corruption.
+fn is_wrong_key_symptom(error: &RarError) -> bool {
+    matches!(
+        error,
+        RarError::HeaderCrcMismatch { .. }
+            | RarError::DataCrcMismatch { .. }
+            | RarError::Blake2Mismatch { .. }
+            | RarError::CorruptArchive { .. }
+            | RarError::TruncatedHeader { .. }
+            | RarError::TruncatedData { .. }
+            | RarError::InvalidVint { .. }
+            | RarError::InvalidHuffmanTable
+            | RarError::UnsupportedFilter { .. }
+            | RarError::SolidStatePoisoned { .. }
+    )
 }
 
 fn extract_rar(
@@ -579,7 +611,14 @@ fn extract_open_rar_archive(
             Ok(written) => written,
             Err(error) => {
                 let _ = fs::remove_file(&destination);
-                return rar_error_response("extract_rar", "failed to extract RAR member", error);
+                let wrong_key =
+                    password.is_some() && info.is_encrypted && is_wrong_key_symptom(&error);
+                let mut response =
+                    rar_error_response("extract_rar", "failed to extract RAR member", error);
+                if wrong_key {
+                    response.status = ArchivePluginStatus::PasswordInvalid;
+                }
+                return response;
             }
         };
 
@@ -1570,6 +1609,63 @@ mod tests {
             fs::read(output.path().join("Example.Show.S01E01.srt")).unwrap(),
             b"1\n00:00:01,000 --> 00:00:02,000\nplain\n"
         );
+    }
+
+    fn rar_fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rar")
+            .join(name)
+    }
+
+    /// RAR4 stores no password check value, so a wrong key only shows up as
+    /// headers or data that fail their CRC. With a password supplied and
+    /// encryption present, that is a wrong password, not a damaged archive.
+    #[test]
+    fn rar4_wrong_password_is_password_invalid() {
+        for (fixture, password) in [
+            // Data-only encryption, stored.
+            ("rar4_enc_store.rar", "testpass123"),
+            // Data-only encryption, compressed: the garbage fails to unpack.
+            ("rar4_enc_lz.rar", "testpass123"),
+            // Header encryption: the headers themselves fail to decrypt.
+            ("rar4_hp_store.rar", "secretpass"),
+        ] {
+            let source = tempfile::tempdir().unwrap();
+            fs::copy(rar_fixture(fixture), source.path().join(fixture)).unwrap();
+            let archive = source.path().join(fixture);
+
+            let wrong_output = tempfile::tempdir().unwrap();
+            let wrong = extract_rar(&archive, wrong_output.path(), Some("not-the-password"));
+            assert_eq!(
+                wrong.status,
+                ArchivePluginStatus::PasswordInvalid,
+                "{fixture}: {:?}",
+                wrong.message
+            );
+            assert!(wrong.files.is_empty(), "{fixture}");
+            assert_eq!(
+                fs::read_dir(wrong_output.path()).unwrap().count(),
+                0,
+                "{fixture}: a wrong password must not leave output behind"
+            );
+
+            let missing = extract_rar(&archive, tempfile::tempdir().unwrap().path(), None);
+            assert_eq!(
+                missing.status,
+                ArchivePluginStatus::PasswordRequired,
+                "{fixture}: {:?}",
+                missing.message
+            );
+
+            let right_output = tempfile::tempdir().unwrap();
+            let right = extract_rar(&archive, right_output.path(), Some(password));
+            assert_eq!(
+                right.status,
+                ArchivePluginStatus::Ok,
+                "{fixture}: {:?}",
+                right.message
+            );
+        }
     }
 
     #[test]

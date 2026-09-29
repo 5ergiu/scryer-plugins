@@ -49,6 +49,7 @@ const GUEST_SOURCE_ROOT: &str = "/scryer/source";
 const GUEST_OUTPUT_ROOT: &str = "/scryer/output";
 const GUEST_SCRATCH_ROOT: &str = "/tmp";
 const RAR_PASSWORD: &str = "testpass123";
+const RAR4_HP_PASSWORD: &str = "secretpass";
 const SEVENZ_PASSWORD: &str = "sevenz-pass-42";
 
 static AES_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -207,9 +208,11 @@ fn assert_encrypted_rars_use_the_crypto_import(wasm_path: &Path) {
     let source = stage_files(&[
         fixture_path("rar/rar4_enc_store.rar"),
         fixture_path("rar/rar5_enc_lz.rar"),
+        fixture_path("rar/rar4_hp_store.rar"),
     ]);
     let before = host_call_counts();
     assert_encrypted_rar4_password_states(wasm_path, source.path());
+    assert_header_encrypted_rar4_password_states(wasm_path, source.path());
     assert_encrypted_rar5_password_states(wasm_path, source.path());
     let after = host_call_counts();
 
@@ -245,7 +248,14 @@ fn assert_encrypted_rar4_password_states(wasm_path: &Path, source: &Path) {
         ArchivePluginFormat::Rar,
         Some("not-the-password"),
     );
-    assert_eq!(wrong.status, ArchivePluginStatus::Failed);
+    // RAR4 has no password check value: the wrong key shows up as a data CRC
+    // mismatch, which with a password supplied is a wrong password.
+    assert_eq!(
+        wrong.status,
+        ArchivePluginStatus::PasswordInvalid,
+        "RAR4 wrong password: {:?}",
+        wrong.message
+    );
 
     let output = tempfile::tempdir().expect("create RAR4 output dir");
     let correct = extract_archive(
@@ -267,6 +277,66 @@ fn assert_encrypted_rar4_password_states(wasm_path: &Path, source: &Path) {
         output.path(),
         &fs::read(fixture_path("rar/small.txt")).expect("read RAR4 plaintext"),
         "encrypted RAR4",
+    );
+}
+
+/// `rar -hp` on RAR4: the headers are encrypted too, so a wrong key is
+/// caught while reading the member list rather than while unpacking it.
+fn assert_header_encrypted_rar4_password_states(wasm_path: &Path, source: &Path) {
+    let archive = "rar4_hp_store.rar";
+    let missing_output = tempfile::tempdir().expect("create no-password RAR4 -hp output dir");
+    let missing = extract_archive(
+        wasm_path,
+        source,
+        missing_output.path(),
+        archive,
+        ArchivePluginFormat::Rar,
+        None,
+    );
+    assert_eq!(
+        missing.status,
+        ArchivePluginStatus::PasswordRequired,
+        "RAR4 -hp without a password: {:?}",
+        missing.message
+    );
+
+    let wrong_output = tempfile::tempdir().expect("create wrong-password RAR4 -hp output dir");
+    let wrong = extract_archive(
+        wasm_path,
+        source,
+        wrong_output.path(),
+        archive,
+        ArchivePluginFormat::Rar,
+        Some("not-the-password"),
+    );
+    assert_eq!(
+        wrong.status,
+        ArchivePluginStatus::PasswordInvalid,
+        "RAR4 -hp wrong password: {:?}",
+        wrong.message
+    );
+    assert!(wrong.files.is_empty());
+
+    let output = tempfile::tempdir().expect("create RAR4 -hp output dir");
+    let correct = extract_archive(
+        wasm_path,
+        source,
+        output.path(),
+        archive,
+        ArchivePluginFormat::Rar,
+        Some(RAR4_HP_PASSWORD),
+    );
+    assert_eq!(
+        correct.status,
+        ArchivePluginStatus::Ok,
+        "RAR4 -hp: {:?}",
+        correct.message
+    );
+    assert_response_contains_file_bytes(
+        &correct,
+        output.path(),
+        b"This is a test file for RAR4 header encryption.\n",
+        "header-encrypted RAR4",
     );
 }
 
