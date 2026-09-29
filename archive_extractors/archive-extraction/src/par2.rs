@@ -993,7 +993,7 @@ fn safe_relative_path_lossy(path: &str) -> PathBuf {
 /// Handles both naming schemes: modern `name.partN.rar` and the legacy
 /// `name.rar` / `name.r00` / `name.s00` families, whose ordering is `.rar`
 /// first and then `r00..r99`, `s00..s99`, and so on.
-fn rar_volume_info(file_name: &str) -> Option<(String, usize)> {
+pub(crate) fn rar_volume_info(file_name: &str) -> Option<(String, usize)> {
     if let Some(stem) = file_name.strip_suffix(".rar") {
         if let Some((group, part)) = stem.rsplit_once(".part")
             && let Ok(part_index) = part.parse::<usize>()

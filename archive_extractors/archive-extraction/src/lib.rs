@@ -858,30 +858,50 @@ fn attach_rar_volumes(
     source_dir: &Path,
     archive_path: &Path,
 ) -> Result<(), RarError> {
-    let mut volume_paths = collect_rar_volume_paths(source_dir, archive_path)?;
-    volume_paths.sort();
-
-    for (offset, volume_path) in volume_paths.into_iter().enumerate() {
+    for (index, volume_path) in collect_rar_volume_paths(source_dir, archive_path)? {
         let volume_file = fs::File::open(&volume_path)?;
-        archive.add_volume(offset + 1, Box::new(volume_file))?;
+        archive.add_volume(index, Box::new(volume_file))?;
     }
 
     Ok(())
 }
 
+/// The later volumes of the primary archive's own set, each with its volume
+/// index relative to the primary (which is volume 0).
+///
+/// A directory can hold more than one RAR set, so a sibling only belongs when
+/// it has the primary's set name (ignoring ASCII case) under the same naming
+/// scheme: `name.partN.rar`, or the legacy `name.rar`, `name.r00`…`name.r99`,
+/// `name.s00`…, which is what RAR continues with once `.r99` is used up. The
+/// index comes from the name rather than the listing order, so a missing
+/// volume leaves a gap the extractor reports instead of shifting every later
+/// volume down by one.
 fn collect_rar_volume_paths(
     source_dir: &Path,
     archive_path: &Path,
-) -> Result<Vec<PathBuf>, RarError> {
+) -> Result<Vec<(usize, PathBuf)>, RarError> {
     let archive_file_name = archive_path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let entries = fs::read_dir(source_dir)?;
-    let mut paths = Vec::new();
+    let named_volume = rar_volume_name(&archive_file_name);
+    let primary_is_a_volume_name = named_volume.is_some();
+    let primary = named_volume.unwrap_or_else(|| {
+        // An archive under a name that is not a RAR volume name at all still
+        // anchors a legacy set by its stem: `name.bin` pairs with `name.r00`.
+        let stem = archive_file_name
+            .rsplit_once('.')
+            .map_or(archive_file_name.as_str(), |(stem, _)| stem);
+        RarVolumeName {
+            modern: false,
+            set_name: stem.to_string(),
+            index: 0,
+        }
+    });
 
-    for entry in entries {
+    let mut volumes = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(source_dir)? {
         let entry = entry?;
         let path = entry.path();
         if path == archive_path || !path.is_file() {
@@ -890,29 +910,52 @@ fn collect_rar_volume_paths(
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if is_likely_rar_volume(&file_name.to_ascii_lowercase(), &archive_file_name) {
-            paths.push(path);
+        let Some(volume) = rar_volume_name(&file_name.to_ascii_lowercase()) else {
+            continue;
+        };
+        if volume.modern != primary.modern || volume.set_name != primary.set_name {
+            continue;
+        }
+        if volume.index == primary.index && !primary_is_a_volume_name {
+            continue;
+        }
+        if volume.index == primary.index || volumes.contains_key(&volume.index) {
+            return Err(RarError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "more than one file is RAR volume {} of this set",
+                    volume.index + 1
+                ),
+            )));
+        }
+        // A volume before the one the host named cannot be attached after it.
+        if let Some(index) = volume.index.checked_sub(primary.index) {
+            volumes.insert(index, path);
         }
     }
 
-    Ok(paths)
+    Ok(volumes.into_iter().collect())
 }
 
-fn is_likely_rar_volume(file_name: &str, first_archive_file_name: &str) -> bool {
-    if file_name == first_archive_file_name {
-        return false;
-    }
-    if file_name.ends_with(".rar") && file_name.contains(".part") {
-        return true;
-    }
-    let Some((_, extension)) = file_name.rsplit_once('.') else {
-        return false;
-    };
-    extension.len() == 3
-        && extension.starts_with('r')
-        && extension[1..]
-            .chars()
-            .all(|character| character.is_ascii_digit())
+struct RarVolumeName {
+    /// `name.partN.rar`, as opposed to the legacy `name.rar` / `name.rNN`.
+    modern: bool,
+    set_name: String,
+    index: usize,
+}
+
+/// Parse a lowercased file name as a RAR volume name, through the same
+/// scheme the PAR2 target resolution uses.
+fn rar_volume_name(file_name: &str) -> Option<RarVolumeName> {
+    let (set_name, index) = par2::rar_volume_info(file_name)?;
+    let modern = file_name
+        .strip_suffix(".rar")
+        .is_some_and(|stem| stem.len() > set_name.len());
+    Some(RarVolumeName {
+        modern,
+        set_name,
+        index,
+    })
 }
 
 fn normalize_relative_path(path: &Path) -> PathBuf {
@@ -1317,6 +1360,181 @@ mod tests {
         assert_eq!(response.status, ArchivePluginStatus::Failed);
         assert_eq!(response.error_code.as_deref(), Some("compressed_too_large"));
         assert!(!output.path().join("subtitle.srt").exists());
+    }
+
+    fn touch_all(dir: &Path, names: &[&str]) {
+        for name in names {
+            fs::write(dir.join(name), b"").expect("write volume stub");
+        }
+    }
+
+    fn collected(dir: &Path, primary: &str) -> Vec<(usize, String)> {
+        collect_rar_volume_paths(dir, &dir.join(primary))
+            .expect("collect RAR volumes")
+            .into_iter()
+            .map(|(index, path)| {
+                (
+                    index,
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rar_volumes_of_another_set_in_the_same_directory_are_not_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_all(
+            dir.path(),
+            &[
+                "Example.Show.S01E01.part1.rar",
+                "Example.Show.S01E01.part2.rar",
+                "EXAMPLE.SHOW.S01E01.PART3.RAR",
+                "Example.Show.S01E02.part1.rar",
+                "Example.Show.S01E02.part2.rar",
+                "Example.Show.S01E01.rar",
+                "Example.Show.S01E01.r00",
+                "Example.Show.S01E02.r00",
+                "Example.Show.S01E01.nfo",
+            ],
+        );
+
+        assert_eq!(
+            collected(dir.path(), "Example.Show.S01E01.part1.rar"),
+            [
+                (1, "Example.Show.S01E01.part2.rar".to_string()),
+                (2, "EXAMPLE.SHOW.S01E01.PART3.RAR".to_string()),
+            ]
+        );
+        assert_eq!(
+            collected(dir.path(), "Example.Show.S01E01.rar"),
+            [(1, "Example.Show.S01E01.r00".to_string())]
+        );
+    }
+
+    #[test]
+    fn rar_part_volumes_are_ordered_by_number_not_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = (1..=11)
+            .map(|part| format!("Example.Show.S01E01.part{part}.rar"))
+            .collect::<Vec<_>>();
+        touch_all(
+            dir.path(),
+            &names.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+
+        let volumes = collected(dir.path(), "Example.Show.S01E01.part1.rar");
+
+        assert_eq!(
+            volumes,
+            (2..=11)
+                .map(|part| (part - 1, format!("Example.Show.S01E01.part{part}.rar")))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Old-style naming runs `.rar`, `.r00`…`.r99`, then carries on at `.s00`.
+    #[test]
+    fn legacy_rar_volumes_continue_past_r99_into_s00() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut names = vec!["Example.Show.S01E01.rar".to_string()];
+        names.extend((0..100).map(|number| format!("Example.Show.S01E01.r{number:02}")));
+        names.extend((0..3).map(|number| format!("Example.Show.S01E01.s{number:02}")));
+        touch_all(
+            dir.path(),
+            &names.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+
+        let volumes = collected(dir.path(), "Example.Show.S01E01.rar");
+
+        assert_eq!(volumes.len(), 103);
+        assert_eq!(volumes[0], (1, "Example.Show.S01E01.r00".to_string()));
+        assert_eq!(volumes[99], (100, "Example.Show.S01E01.r99".to_string()));
+        assert_eq!(volumes[100], (101, "Example.Show.S01E01.s00".to_string()));
+        assert_eq!(volumes[102], (103, "Example.Show.S01E01.s02".to_string()));
+    }
+
+    #[test]
+    fn a_missing_rar_volume_leaves_a_gap_instead_of_renumbering() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_all(
+            dir.path(),
+            &[
+                "Example.Show.S01E01.rar",
+                "Example.Show.S01E01.r00",
+                "Example.Show.S01E01.r02",
+            ],
+        );
+
+        assert_eq!(
+            collected(dir.path(), "Example.Show.S01E01.rar"),
+            [
+                (1, "Example.Show.S01E01.r00".to_string()),
+                (3, "Example.Show.S01E01.r02".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_files_claiming_one_rar_volume_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_all(
+            dir.path(),
+            &[
+                "Example.Show.S01E01.part1.rar",
+                "Example.Show.S01E01.part2.rar",
+                "Example.Show.S01E01.part02.rar",
+            ],
+        );
+
+        assert!(
+            collect_rar_volume_paths(
+                dir.path(),
+                &dir.path().join("Example.Show.S01E01.part1.rar")
+            )
+            .is_err()
+        );
+    }
+
+    /// The real multi-volume fixture, next to a second copy of itself under
+    /// another set name: extracting one set must not attach the other's
+    /// volumes, which carry the same volume numbers.
+    #[test]
+    fn a_multivolume_rar_extracts_beside_another_set() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/par2");
+        for part in 1..=6 {
+            let fixture = fixtures.join(format!("fixture_rar5_lz_plain.part{part}.rar"));
+            fs::copy(
+                &fixture,
+                source
+                    .path()
+                    .join(format!("Example.Show.S01E01.part{part}.rar")),
+            )
+            .unwrap();
+            fs::copy(
+                &fixture,
+                source
+                    .path()
+                    .join(format!("Example.Show.S01E02.part{part}.rar")),
+            )
+            .unwrap();
+        }
+
+        let response = extract_rar(
+            &source.path().join("Example.Show.S01E01.part1.rar"),
+            output.path(),
+            None,
+        );
+
+        assert_eq!(
+            response.status,
+            ArchivePluginStatus::Ok,
+            "{:?}",
+            response.message
+        );
+        assert_eq!(response.expanded_bytes, Some(1_109_271));
     }
 
     #[test]
