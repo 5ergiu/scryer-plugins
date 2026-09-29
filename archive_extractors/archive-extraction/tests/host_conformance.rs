@@ -342,6 +342,25 @@ fn assert_zip_extracts(wasm_path: &Path) {
         response.message
     );
     assert_response_contains_file_bytes(&response, output.path(), b"hello from zip\n", "ZIP");
+
+    // The host passes a download's password along without knowing whether
+    // the archive needs one; a plain archive ignores it.
+    let output = tempfile::tempdir().expect("create password ZIP output dir");
+    let response = extract_archive(
+        wasm_path,
+        source.path(),
+        output.path(),
+        "sample.zip",
+        ArchivePluginFormat::Zip,
+        Some("unneeded-password"),
+    );
+    assert_eq!(
+        response.status,
+        ArchivePluginStatus::Ok,
+        "plain ZIP with a password: {:?}",
+        response.message
+    );
+    assert_response_contains_file_bytes(&response, output.path(), b"hello from zip\n", "ZIP");
 }
 
 fn assert_zip_path_escape_is_rejected(wasm_path: &Path) {

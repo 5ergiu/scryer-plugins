@@ -616,14 +616,9 @@ fn extract_zip<R: Read + Seek>(
     output_dir: &Path,
     password: Option<&str>,
 ) -> ArchivePluginProcessResponse {
-    if password.is_some_and(|password| !password.is_empty()) {
-        return ArchivePluginProcessResponse {
-            status: ArchivePluginStatus::PasswordRequired,
-            message: Some("encrypted ZIP archives are not implemented yet".to_string()),
-            ..empty_response()
-        };
-    }
-
+    // A password is only ever applied to an entry flagged as encrypted; the
+    // zip crate reads every other entry as plaintext whatever was supplied.
+    let password = password.filter(|password| !password.is_empty());
     let mut archive = match zip::ZipArchive::new(source) {
         Ok(archive) => archive,
         Err(error) => return failed_response("read_zip", "failed to read ZIP archive", error),
@@ -647,7 +642,11 @@ fn extract_zip<R: Read + Seek>(
     }
 
     for index in 0..archive.len() {
-        let mut entry = match archive.by_index(index) {
+        let entry = match password {
+            Some(password) => archive.by_index_decrypt(index, password.as_bytes()),
+            None => archive.by_index(index),
+        };
+        let mut entry = match entry {
             Ok(entry) => entry,
             Err(error) => return failed_response("read_entry", "failed to read ZIP entry", error),
         };
@@ -1535,6 +1534,42 @@ mod tests {
             response.message
         );
         assert_eq!(response.expanded_bytes, Some(1_109_271));
+    }
+
+    /// A password the host passes along for a download is not a claim that
+    /// the archive is encrypted: plain entries extract regardless.
+    #[test]
+    fn a_plain_zip_extracts_when_a_password_is_supplied() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let archive = source.path().join("Example.Show.S01E01.zip");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+        zip.start_file(
+            "Example.Show.S01E01.srt",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(b"1\n00:00:01,000 --> 00:00:02,000\nplain\n")
+            .unwrap();
+        zip.finish().unwrap();
+
+        let response = extract_archive(
+            archive.to_str().unwrap(),
+            output.path().to_str().unwrap(),
+            ArchivePluginFormat::Zip,
+            Some("Example-Password"),
+        );
+
+        assert_eq!(
+            response.status,
+            ArchivePluginStatus::Ok,
+            "{:?}",
+            response.message
+        );
+        assert_eq!(
+            fs::read(output.path().join("Example.Show.S01E01.srt")).unwrap(),
+            b"1\n00:00:01,000 --> 00:00:02,000\nplain\n"
+        );
     }
 
     #[test]
