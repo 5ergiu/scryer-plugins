@@ -73,6 +73,7 @@ fn archive_extraction_release_wasm_conforms_to_host_contract() {
     assert_xz_extracts(&wasm_path);
     assert_zip_extracts(&wasm_path);
     assert_zip_path_escape_is_rejected(&wasm_path);
+    assert_split_archives_are_joined(&wasm_path);
     assert_par2_repairs_a_damaged_archive_before_extracting(&wasm_path);
     assert_par2_emits_repaired_plain_files(&wasm_path);
     assert_par2_unrepairable_damage_fails(&wasm_path);
@@ -362,6 +363,84 @@ fn assert_zip_path_escape_is_rejected(wasm_path: &Path) {
     let output_parent = output.path().parent().expect("temp output has a parent");
     assert!(!output_parent.join("escape.txt").exists());
     assert!(!output.path().join("escape.txt").exists());
+}
+
+/// Byte-split sets are read in place through the READ-ONLY source preopen:
+/// the guest has to list the directory for the later parts and join them as
+/// one stream, since there is nowhere writable beside them to join on disk.
+fn assert_split_archives_are_joined(wasm_path: &Path) {
+    let contents = deterministic_bytes(0x5B17_0001, 96 * 1024);
+    let sevenz = tempfile::tempdir().expect("create split 7z fixture dir");
+    let sevenz_path = sevenz.path().join("whole.7z");
+    create_sevenz_fixture(&sevenz_path, "Example.Show.S01E01.mkv", &contents);
+    let zip = tempfile::tempdir().expect("create split ZIP fixture dir");
+    let zip_path = zip.path().join("whole.zip");
+    create_zip_fixture_with_contents(&zip_path, "Example.Show.S01E01.mkv", &contents);
+
+    for (whole, set_name, format) in [
+        (
+            &sevenz_path,
+            "Example.Show.S01E01.7z",
+            ArchivePluginFormat::SevenZip,
+        ),
+        (
+            &zip_path,
+            "Example.Show.S01E01.zip",
+            ArchivePluginFormat::Zip,
+        ),
+        (
+            &zip_path,
+            "Example.Show.S01E01",
+            ArchivePluginFormat::SevenZip,
+        ),
+    ] {
+        let source = tempfile::tempdir().expect("create split source dir");
+        split_file_into(whole, source.path(), set_name, 3);
+        let output = tempfile::tempdir().expect("create split output dir");
+        let response = extract_archive(
+            wasm_path,
+            source.path(),
+            output.path(),
+            &format!("{set_name}.001"),
+            format,
+            None,
+        );
+        assert_eq!(
+            response.status,
+            ArchivePluginStatus::Ok,
+            "split {set_name}: {:?}",
+            response.message
+        );
+        assert_response_contains_file_bytes(&response, output.path(), &contents, set_name);
+    }
+
+    let source = tempfile::tempdir().expect("create gapped split source dir");
+    let parts = split_file_into(&sevenz_path, source.path(), "Example.Show.S01E01.7z", 3);
+    fs::remove_file(&parts[1]).expect("drop the middle part");
+    let output = tempfile::tempdir().expect("create gapped split output dir");
+    let response = extract_archive(
+        wasm_path,
+        source.path(),
+        output.path(),
+        "Example.Show.S01E01.7z.001",
+        ArchivePluginFormat::SevenZip,
+        None,
+    );
+    assert_eq!(response.status, ArchivePluginStatus::Failed);
+    assert_eq!(
+        response.error_code.as_deref(),
+        Some("missing_volume"),
+        "{:?}",
+        response.message
+    );
+    assert!(
+        response
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("Example.Show.S01E01.7z.002")),
+        "{:?}",
+        response.message
+    );
 }
 
 fn assert_sevenz_extracts(wasm_path: &Path) {
@@ -1007,6 +1086,20 @@ fn damage_slices(path: &Path, slices: &[u64]) {
         file.write_all(&vec![0xA5_u8; PAR2_SLICE_BYTES as usize])
             .expect("write damage");
     }
+}
+
+/// Cut `whole` into `parts` byte ranges named `{set_name}.001`, `.002`, …
+fn split_file_into(whole: &Path, dir: &Path, set_name: &str, parts: usize) -> Vec<PathBuf> {
+    let bytes = fs::read(whole).expect("read archive to split");
+    bytes
+        .chunks(bytes.len().div_ceil(parts))
+        .enumerate()
+        .map(|(index, chunk)| {
+            let path = dir.join(format!("{set_name}.{:03}", index + 1));
+            fs::write(&path, chunk).expect("write split part");
+            path
+        })
+        .collect()
 }
 
 fn create_zip_fixture(path: &Path, entry_name: &str, payload: &[u8]) {

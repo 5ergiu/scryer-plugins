@@ -40,12 +40,13 @@ use sevenz_turbo::hooks as sevenz_hooks;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use unrar_rs::hooks::{HostAesError, HostCryptoHooks, install_host_crypto_hooks};
 use unrar_rs::{RarArchive, RarError};
 
 mod par2;
+mod split_volumes;
 
 wit_bindgen::generate!({
     world: "archive-extractor",
@@ -270,9 +271,29 @@ fn extract_prepared_archive(
 ) -> ArchivePluginProcessResponse {
     match format {
         ArchivePluginFormat::Rar => extract_rar(archive_path, output_dir, password),
-        ArchivePluginFormat::SevenZip => extract_sevenz(archive_path, output_dir, password),
-        ArchivePluginFormat::Zip => extract_zip(archive_path, output_dir, password),
+        ArchivePluginFormat::SevenZip | ArchivePluginFormat::Zip => {
+            extract_seekable_archive(archive_path, output_dir, format, password)
+        }
         ArchivePluginFormat::Xz => extract_xz(archive_path, output_dir, password),
+    }
+}
+
+/// 7z and ZIP read through one seekable stream, which is what lets a
+/// byte-split set (`name.7z.001`, `name.zip.001`, `name.001`) extract as the
+/// single archive it was cut from.
+fn extract_seekable_archive(
+    archive_path: &Path,
+    output_dir: &Path,
+    format: ArchivePluginFormat,
+    password: Option<&str>,
+) -> ArchivePluginProcessResponse {
+    let (source, format) = match split_volumes::open_archive(archive_path, format) {
+        Ok(opened) => opened,
+        Err(response) => return *response,
+    };
+    match format {
+        ArchivePluginFormat::Zip => extract_zip(source, output_dir, password),
+        _ => extract_sevenz(source, output_dir, password),
     }
 }
 
@@ -590,8 +611,8 @@ fn extract_open_rar_archive(
     }
 }
 
-fn extract_zip(
-    archive_path: &Path,
+fn extract_zip<R: Read + Seek>(
+    source: R,
     output_dir: &Path,
     password: Option<&str>,
 ) -> ArchivePluginProcessResponse {
@@ -603,11 +624,7 @@ fn extract_zip(
         };
     }
 
-    let archive_file = match fs::File::open(archive_path) {
-        Ok(file) => file,
-        Err(error) => return failed_response("open_zip", "failed to open ZIP archive", error),
-    };
-    let mut archive = match zip::ZipArchive::new(archive_file) {
+    let mut archive = match zip::ZipArchive::new(source) {
         Ok(archive) => archive,
         Err(error) => return failed_response("read_zip", "failed to read ZIP archive", error),
     };
@@ -730,20 +747,16 @@ fn extract_zip(
     }
 }
 
-fn extract_sevenz(
-    archive_path: &Path,
+fn extract_sevenz<R: Read + Seek>(
+    source: R,
     output_dir: &Path,
     password: Option<&str>,
 ) -> ArchivePluginProcessResponse {
-    let archive_file = match fs::File::open(archive_path) {
-        Ok(file) => file,
-        Err(error) => return failed_response("open_7z", "failed to open 7z archive", error),
-    };
     let password_value = match password.filter(|password| !password.is_empty()) {
         Some(password) => sevenz_turbo::Password::from(password),
         None => sevenz_turbo::Password::empty(),
     };
-    let mut archive = match sevenz_turbo::ArchiveReader::new(archive_file, password_value) {
+    let mut archive = match sevenz_turbo::ArchiveReader::new(source, password_value) {
         Ok(archive) => archive,
         Err(error) => return sevenz_error_response("read_7z", error, password),
     };
@@ -1621,6 +1634,263 @@ mod par2_tests {
                 .map(|file| file.relative_path.as_str())
                 .collect::<Vec<_>>(),
             ["episode.mkv"]
+        );
+    }
+}
+
+/// Byte-split 7z and ZIP sets, end to end through [`extract_archive`].
+#[cfg(test)]
+mod split_volume_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn payload(len: usize) -> Vec<u8> {
+        let mut state = 0x5EED_u64 | 0x9E37_79B9_7F4A_7C15;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.extend_from_slice(&state.wrapping_mul(0x2545_F491_4F6C_DD1D).to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn sevenz_bytes(entry: &str, contents: &[u8]) -> Vec<u8> {
+        let mut archive =
+            sevenz_turbo::ArchiveWriter::new(Cursor::new(Vec::new())).expect("create 7z fixture");
+        archive
+            .push_archive_entry(sevenz_turbo::ArchiveEntry::new_file(entry), Some(contents))
+            .expect("write 7z fixture entry");
+        archive.finish().expect("finish 7z fixture").into_inner()
+    }
+
+    fn zip_bytes(entry: &str, contents: &[u8]) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        zip.start_file(entry, zip::write::SimpleFileOptions::default())
+            .expect("start ZIP entry");
+        zip.write_all(contents).expect("write ZIP payload");
+        zip.finish().expect("finish ZIP fixture").into_inner()
+    }
+
+    /// Cut `bytes` into `parts` roughly equal files named `{set_name}.001`…
+    fn split_into(dir: &Path, set_name: &str, bytes: &[u8], parts: usize) -> Vec<PathBuf> {
+        let chunk = bytes.len().div_ceil(parts);
+        bytes
+            .chunks(chunk)
+            .enumerate()
+            .map(|(index, part)| {
+                let path = dir.join(format!("{set_name}.{:03}", index + 1));
+                fs::write(&path, part).expect("write split part");
+                path
+            })
+            .collect()
+    }
+
+    fn extract(
+        source: &Path,
+        output: &Path,
+        archive: &str,
+        format: ArchivePluginFormat,
+    ) -> ArchivePluginProcessResponse {
+        extract_archive(
+            source.join(archive).to_str().unwrap(),
+            output.to_str().unwrap(),
+            format,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_split_7z_extracts_as_one_archive() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let contents = payload(96 * 1024);
+        split_into(
+            source.path(),
+            "Example.Show.S01E01.7z",
+            &sevenz_bytes("Example.Show.S01E01.mkv", &contents),
+            3,
+        );
+
+        let response = extract(
+            source.path(),
+            output.path(),
+            "Example.Show.S01E01.7z.001",
+            ArchivePluginFormat::SevenZip,
+        );
+
+        assert_eq!(
+            response.status,
+            ArchivePluginStatus::Ok,
+            "{:?}",
+            response.message
+        );
+        assert_eq!(
+            fs::read(output.path().join("Example.Show.S01E01.mkv")).unwrap(),
+            contents
+        );
+    }
+
+    #[test]
+    fn a_split_zip_extracts_as_one_archive() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let contents = payload(96 * 1024);
+        split_into(
+            source.path(),
+            "Example.Show.S01E01.zip",
+            &zip_bytes("Example.Show.S01E01.mkv", &contents),
+            4,
+        );
+
+        let response = extract(
+            source.path(),
+            output.path(),
+            "Example.Show.S01E01.zip.001",
+            ArchivePluginFormat::Zip,
+        );
+
+        assert_eq!(
+            response.status,
+            ArchivePluginStatus::Ok,
+            "{:?}",
+            response.message
+        );
+        assert_eq!(
+            fs::read(output.path().join("Example.Show.S01E01.mkv")).unwrap(),
+            contents
+        );
+    }
+
+    /// A bare `name.001` says nothing about its contents, so the joined
+    /// stream's signature wins over whichever format the host guessed.
+    #[test]
+    fn a_bare_numbered_set_extracts_by_its_signature() {
+        for (bytes, host_format) in [
+            (
+                sevenz_bytes("Example.Show.S01E01.mkv", &payload(40_000)),
+                ArchivePluginFormat::Zip,
+            ),
+            (
+                zip_bytes("Example.Show.S01E01.mkv", &payload(40_000)),
+                ArchivePluginFormat::SevenZip,
+            ),
+        ] {
+            let source = tempfile::tempdir().unwrap();
+            let output = tempfile::tempdir().unwrap();
+            split_into(source.path(), "Example.Show.S01E01", &bytes, 2);
+
+            let response = extract(
+                source.path(),
+                output.path(),
+                "Example.Show.S01E01.001",
+                host_format,
+            );
+
+            assert_eq!(
+                response.status,
+                ArchivePluginStatus::Ok,
+                "{:?}",
+                response.message
+            );
+            assert_eq!(
+                fs::read(output.path().join("Example.Show.S01E01.mkv")).unwrap(),
+                payload(40_000)
+            );
+        }
+    }
+
+    #[test]
+    fn a_split_set_with_a_missing_middle_volume_names_it() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let parts = split_into(
+            source.path(),
+            "Example.Show.S01E01.7z",
+            &sevenz_bytes("Example.Show.S01E01.mkv", &payload(96 * 1024)),
+            3,
+        );
+        fs::remove_file(&parts[1]).unwrap();
+
+        let response = extract(
+            source.path(),
+            output.path(),
+            "Example.Show.S01E01.7z.001",
+            ArchivePluginFormat::SevenZip,
+        );
+
+        assert_eq!(response.status, ArchivePluginStatus::Failed);
+        assert_eq!(response.error_code.as_deref(), Some("missing_volume"));
+        assert!(
+            response
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("'Example.Show.S01E01.7z.002'")),
+            "{:?}",
+            response.message
+        );
+        assert!(!output.path().join("Example.Show.S01E01.mkv").exists());
+    }
+
+    /// A recovery set over the parts of a split archive protects an archive,
+    /// not plain media: the damaged part is repaired in the scratch copy and
+    /// the joined parts are extracted from there.
+    #[test]
+    fn a_damaged_split_set_is_repaired_then_joined() {
+        use par2_rs::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
+        use std::io::{Seek, SeekFrom};
+
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let contents = payload(96 * 1024);
+        let parts = split_into(
+            source.path(),
+            "Example.Show.S01E01.7z",
+            &sevenz_bytes("Example.Show.S01E01.mkv", &contents),
+            3,
+        );
+        let mut options = Par2CreatorOptions::with_output(
+            source.path().join("recovery"),
+            Some(source.path().to_path_buf()),
+            parts.clone(),
+        );
+        options.block_sizing = BlockSizing::Bytes(4_096);
+        options.recovery_amount = RecoveryAmount::Count(4);
+        let creator = Par2Creator::new(options);
+        let plan = creator.plan().expect("plan PAR2 creation");
+        creator.create(&plan).expect("create PAR2 recovery set");
+
+        let mut damaged = fs::OpenOptions::new().write(true).open(&parts[1]).unwrap();
+        damaged.seek(SeekFrom::Start(4_096)).unwrap();
+        damaged.write_all(&[0xA5; 4_096]).unwrap();
+        drop(damaged);
+
+        let response = extract(
+            source.path(),
+            output.path(),
+            "Example.Show.S01E01.7z.001",
+            ArchivePluginFormat::SevenZip,
+        );
+
+        assert_eq!(
+            response.status,
+            ArchivePluginStatus::Ok,
+            "{:?}",
+            response.message
+        );
+        assert_eq!(
+            response
+                .files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            ["Example.Show.S01E01.mkv"]
+        );
+        assert_eq!(
+            fs::read(output.path().join("Example.Show.S01E01.mkv")).unwrap(),
+            contents
         );
     }
 }
