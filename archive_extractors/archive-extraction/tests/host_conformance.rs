@@ -565,6 +565,24 @@ fn assert_sevenz_extracts(wasm_path: &Path) {
         after.crc > before.crc,
         "7z extraction did not call the crypto crc32 import"
     );
+
+    // A password handed along for a plain archive is ignored.
+    let output = tempfile::tempdir().expect("create password 7z output dir");
+    let response = extract_archive(
+        wasm_path,
+        source.path(),
+        output.path(),
+        "sample.7z",
+        ArchivePluginFormat::SevenZip,
+        Some("unneeded-password"),
+    );
+    assert_eq!(
+        response.status,
+        ArchivePluginStatus::Ok,
+        "plain 7z with a password: {:?}",
+        response.message
+    );
+    assert_response_contains_file_bytes(&response, output.path(), b"hello from 7z\n", "7z");
 }
 
 fn assert_sevenz_rejects_unsafe_paths(wasm_path: &Path) {

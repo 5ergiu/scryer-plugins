@@ -1668,6 +1668,41 @@ mod tests {
         }
     }
 
+    /// As with ZIP, a password handed along for a download does not make a
+    /// plain 7z encrypted: it is ignored and the archive extracts.
+    #[test]
+    fn a_plain_7z_extracts_when_a_password_is_supplied() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let archive = source.path().join("Example.Show.S01E01.7z");
+        let mut writer = sevenz_turbo::ArchiveWriter::create(&archive).unwrap();
+        writer
+            .push_archive_entry(
+                sevenz_turbo::ArchiveEntry::new_file("Example.Show.S01E01.srt"),
+                Some(b"1\n00:00:01,000 --> 00:00:02,000\nplain\n".as_slice()),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        let response = extract_archive(
+            archive.to_str().unwrap(),
+            output.path().to_str().unwrap(),
+            ArchivePluginFormat::SevenZip,
+            Some("Example-Password"),
+        );
+
+        assert_eq!(
+            response.status,
+            ArchivePluginStatus::Ok,
+            "{:?}",
+            response.message
+        );
+        assert_eq!(
+            fs::read(output.path().join("Example.Show.S01E01.srt")).unwrap(),
+            b"1\n00:00:01,000 --> 00:00:02,000\nplain\n"
+        );
+    }
+
     #[test]
     fn sevenz_unsupported_method_maps_to_structured_error() {
         let response = sevenz_error_response(
