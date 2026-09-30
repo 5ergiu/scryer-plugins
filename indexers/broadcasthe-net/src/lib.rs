@@ -118,9 +118,11 @@ async fn search(req: SearchRequest) -> FnResult<SearchResponse> {
     let base_url = config_value("base_url").unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
     let api_key = required_config("api_key")?;
     if let Some(marker) = catch_up_marker(&req) {
-        return catch_up_search(marker, |query, offset| {
-            fetch_page(&base_url, &api_key, query, offset)
-        })
+        return catch_up_search(
+            marker,
+            |query, offset| fetch_page(&base_url, &api_key, query, offset),
+            has_time_for_a_page,
+        )
         .await;
     }
     let limit = request_limit(&req);
@@ -224,14 +226,28 @@ async fn fetch_page(
     })
 }
 
+/// Time an RSS catch-up keeps in hand before the operation deadline. A page is
+/// only started with at least this much left, so the pages already read are
+/// returned instead of being lost to a host timeout.
+const CATCH_UP_DEADLINE_RESERVE_MS: u64 = 20_000;
+
+/// Whether the operation deadline leaves room to read one more catch-up page.
+fn has_time_for_a_page() -> bool {
+    scryer_plugin_pdk::component::operation_deadline_monotonic_ms()
+        .saturating_sub(scryer_plugin_pdk::component::monotonic_now_ms())
+        >= CATCH_UP_DEADLINE_RESERVE_MS
+}
+
 /// Page the recent feed back to the host's marker. Stops at the first page
 /// that holds the marked release or anything published before it, at a page
-/// BTN reports as the last, or at `MAX_PAGES`; only that last case, or an
-/// upstream failure after at least one page was read, reports the poll as
+/// BTN reports as the last, at `MAX_PAGES`, or when `has_time` says the
+/// operation deadline is too close for another page. Only those last two, or
+/// an upstream failure after at least one page was read, report the poll as
 /// incomplete, carrying every release read so far.
 async fn catch_up_search<F, Fut>(
     marker: &PluginRssCatchUp,
     mut fetch: F,
+    has_time: impl Fn() -> bool,
 ) -> Result<SearchResponse, Error>
 where
     F: FnMut(BtnQuery, usize) -> Fut,
@@ -241,6 +257,16 @@ where
         let mut results = Vec::new();
         let mut stopped: Option<(IndexerSearchIncompleteReason, Option<i64>, String)> = None;
         for page in 0..MAX_PAGES {
+            if page > 0 && !has_time() {
+                stopped = Some((
+                    IndexerSearchIncompleteReason::PageCeilingReached,
+                    None,
+                    format!(
+                        "BTN RSS catch-up stopped after {page} page(s) before the operation deadline"
+                    ),
+                ));
+                break;
+            }
             let fetched = match fetch(query.clone(), page * PAGE_SIZE).await {
                 Ok(fetched) => fetched,
                 Err(error) if page == 0 => return Err(error),
@@ -1005,12 +1031,16 @@ mod tests {
         mut respond: impl FnMut(&BtnQuery, usize) -> Result<CatchUpPage, Error>,
     ) -> (Result<SearchResponse, Error>, Vec<Call>) {
         let calls = RefCell::new(Vec::new());
-        let outcome = block_on(catch_up_search(marker, |query, offset| {
-            calls
-                .borrow_mut()
-                .push((query.id.clone(), query.age.clone(), offset));
-            std::future::ready(respond(&query, offset))
-        }));
+        let outcome = block_on(catch_up_search(
+            marker,
+            |query, offset| {
+                calls
+                    .borrow_mut()
+                    .push((query.id.clone(), query.age.clone(), offset));
+                std::future::ready(respond(&query, offset))
+            },
+            || true,
+        ));
         (outcome, calls.into_inner())
     }
 
@@ -1158,6 +1188,27 @@ mod tests {
         let (response, reason) = partial_results(&error);
         assert_eq!(reason, IndexerSearchIncompleteReason::UpstreamFailure);
         assert_eq!(response.results.len(), PAGE_SIZE);
+    }
+
+    #[test]
+    fn a_deadline_close_to_expiry_returns_the_pages_already_read() {
+        let marker = marker(Some("BTN-1"), published_at(1));
+        let calls = RefCell::new(0usize);
+
+        let outcome = block_on(catch_up_search(
+            &marker,
+            |_, offset| {
+                *calls.borrow_mut() += 1;
+                std::future::ready(Ok(feed_page(offset / PAGE_SIZE, true)))
+            },
+            || *calls.borrow() < 2,
+        ));
+
+        assert_eq!(*calls.borrow(), 2);
+        let error = outcome.expect_err("deadline nears before the marker");
+        let (response, reason) = partial_results(&error);
+        assert_eq!(reason, IndexerSearchIncompleteReason::PageCeilingReached);
+        assert_eq!(response.results.len(), 2 * PAGE_SIZE);
     }
 
     #[test]

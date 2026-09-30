@@ -132,6 +132,10 @@ fn protected_from_extra(extra: &HashMap<String, serde_json::Value>) -> Option<bo
 
 const DEFAULT_MAX_SEARCH_PAGES: usize = 30;
 const DEFAULT_REQUEST_INTERVAL_MS: u64 = 500;
+/// Time an RSS catch-up keeps in hand before the operation deadline. A page is
+/// only started with at least this much left, so the pages already read are
+/// returned instead of being lost to a host timeout.
+const RSS_CATCH_UP_DEADLINE_RESERVE_MS: u64 = 20_000;
 
 pub struct NewznabConfig {
     pub base_url: String,
@@ -1255,9 +1259,16 @@ async fn execute_rss_search(
     let mut last_limits = ApiLimits::default();
     let mut completed_page = false;
     let mut ceiling_search_types: Vec<&'static str> = Vec::new();
+    let mut out_of_time_search_types: Vec<&'static str> = Vec::new();
 
     for &search_type in &search_types {
         for page in 0..max_pages {
+            // Once a page is in hand, another one is only worth starting if it
+            // can finish before the operation deadline.
+            if catch_up.is_some() && completed_page && !rss_catch_up_has_time_for_a_page() {
+                out_of_time_search_types.push(search_type);
+                break;
+            }
             let page_params = if catch_up.is_some() {
                 offset_page_params(&config.additional_params, page * page_size)
             } else {
@@ -1413,6 +1424,20 @@ async fn execute_rss_search(
         search_types.len()
     );
 
+    if !out_of_time_search_types.is_empty() {
+        return Err(incomplete_newznab_search_error(
+            newznab_search_response(all_results, &last_limits),
+            IndexerSearchIncompleteReason::PageCeilingReached,
+            None,
+            completed_page,
+            None,
+            format!(
+                "Newznab RSS catch-up stopped before the operation deadline without reaching the last-seen release for t={}",
+                out_of_time_search_types.join(",")
+            ),
+        ));
+    }
+
     if !ceiling_search_types.is_empty() {
         return Err(incomplete_newznab_search_error(
             newznab_search_response(all_results, &last_limits),
@@ -1537,6 +1562,12 @@ fn offset_page_params(additional_params: &str, offset: usize) -> String {
     } else {
         format!("{additional_params}&offset={offset}")
     }
+}
+
+/// Whether the operation deadline leaves room to read one more catch-up page.
+fn rss_catch_up_has_time_for_a_page() -> bool {
+    component::operation_deadline_monotonic_ms().saturating_sub(component::monotonic_now_ms())
+        >= RSS_CATCH_UP_DEADLINE_RESERVE_MS
 }
 
 /// Whether one RSS page reaches the host's catch-up marker: it contains the
@@ -7604,10 +7635,17 @@ mod tests {
         /// Older than every release a test serves, so only an identity match
         /// can stop paging.
         const DISTANT_PAST: &str = "2023-06-01T00:00:00Z";
+        /// Monotonic time the scripted host reports before any feed request.
+        const RUN_STARTED_AT_MS: u64 = 1_000_000;
 
         #[derive(Default)]
         struct Script {
             active: bool,
+            /// Monotonic time each served feed request takes.
+            ms_per_request: u64,
+            /// Operation deadline as time after the run starts; `None` never
+            /// expires.
+            deadline_after_ms: Option<u64>,
             pages: HashMap<(String, usize), String>,
             requests: Vec<(String, Option<usize>)>,
         }
@@ -7673,11 +7711,25 @@ mod tests {
             }
 
             fn monotonic_now_ms(&self) -> u64 {
-                if active() { 1_000_000 } else { 0 }
+                SCRIPT.with(|script| {
+                    let script = script.borrow();
+                    if script.active {
+                        RUN_STARTED_AT_MS + script.requests.len() as u64 * script.ms_per_request
+                    } else {
+                        0
+                    }
+                })
             }
 
             fn operation_deadline_monotonic_ms(&self) -> u64 {
-                if active() { u64::MAX } else { 0 }
+                SCRIPT.with(|script| {
+                    let script = script.borrow();
+                    match (script.active, script.deadline_after_ms) {
+                        (false, _) => 0,
+                        (true, Some(after_ms)) => RUN_STARTED_AT_MS + after_ms,
+                        (true, None) => u64::MAX,
+                    }
+                })
             }
 
             fn wall_now_ms(&self) -> u64 {
@@ -7949,6 +8001,68 @@ mod tests {
                 }
                 other => panic!("expected partial results, got {other:?}"),
             }
+        }
+
+        /// Each feed request takes `ms_per_request`, and the operation expires
+        /// `deadline_after_ms` after the run starts.
+        fn set_clock(ms_per_request: u64, deadline_after_ms: u64) {
+            SCRIPT.with(|script| {
+                let mut script = script.borrow_mut();
+                script.ms_per_request = ms_per_request;
+                script.deadline_after_ms = Some(deadline_after_ms);
+            });
+        }
+
+        #[test]
+        fn a_deadline_close_to_expiry_returns_the_pages_already_read() {
+            install_script();
+            serve_full_pages("movie", 6);
+            serve_full_pages("tvsearch", 6);
+            // Two requests leave 30 s, enough for a third; three leave 15 s,
+            // less than the reserve.
+            set_clock(15_000, 60_000);
+            let request = rss_request(
+                &["2000", "5000"],
+                Some(marker(DISTANT_PAST, Some("guid-never-served".to_string()))),
+            );
+
+            let error = run(&config(10), &request).expect_err("deadline nears before the marker");
+
+            assert_eq!(
+                requests(),
+                vec![
+                    ("movie".to_string(), Some(0)),
+                    ("movie".to_string(), Some(PAGE_SIZE)),
+                    ("movie".to_string(), Some(2 * PAGE_SIZE)),
+                ],
+                "no page is started inside the reserve, in either feed"
+            );
+            match indexer_search_details(&error) {
+                IndexerSearchPluginError::PartialResults {
+                    response, reason, ..
+                } => {
+                    assert_eq!(reason, IndexerSearchIncompleteReason::PageCeilingReached);
+                    assert_eq!(response.results.len(), 3 * PAGE_SIZE);
+                }
+                other => panic!("expected partial results, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_short_deadline_still_reads_the_first_page() {
+            install_script();
+            serve_full_pages("tvsearch", 1);
+            serve_page("tvsearch", PAGE_SIZE, &[]);
+            set_clock(1_000, 5_000);
+            let request = rss_request(
+                &["5000"],
+                Some(marker("2024-01-01T11:59:00Z", Some(guid("tvsearch", 1)))),
+            );
+
+            let response = run(&config(10), &request).expect("the first page reaches the marker");
+
+            assert_eq!(requests(), tv_offsets(&[0]));
+            assert_eq!(response.results.len(), PAGE_SIZE);
         }
 
         #[test]

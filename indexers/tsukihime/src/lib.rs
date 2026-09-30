@@ -322,6 +322,16 @@ fn recent_torrents_path(limit: usize, offset: usize) -> String {
 const CATCH_UP_PAGE_SIZE: usize = API_MAX_RESULTS;
 const CATCH_UP_MAX_PAGES: usize = 30;
 const CATCH_UP_MAX_TORRENTS: usize = 1_000;
+/// Time an RSS catch-up keeps in hand before the operation deadline. A page is
+/// only started with at least this much left, so the pages already read are
+/// returned instead of being lost to a host timeout.
+const CATCH_UP_DEADLINE_RESERVE_MS: u64 = 20_000;
+
+/// Whether the operation deadline leaves room to read one more catch-up page.
+fn has_time_for_a_page() -> bool {
+    component::operation_deadline_monotonic_ms().saturating_sub(component::monotonic_now_ms())
+        >= CATCH_UP_DEADLINE_RESERVE_MS
+}
 
 /// A recent-feed poll that reads older pages until it reaches the release the
 /// host saw on its previous poll.
@@ -437,6 +447,17 @@ async fn catch_up_recent_results(
 ) -> Result<SearchResponse, TsukihimeError> {
     let mut offset = 0;
     loop {
+        if pager.pages > 0 && !has_time_for_a_page() {
+            return Err(TsukihimeError::Incomplete {
+                response: Box::new(pager.response()),
+                reason: IndexerSearchIncompleteReason::PageCeilingReached,
+                retry_after_seconds: None,
+                detail: format!(
+                    "Tsukihime RSS catch-up stopped after {} page(s) before the operation deadline",
+                    pager.pages
+                ),
+            });
+        }
         let page = match get_json::<TorrentPage>(
             config,
             &recent_torrents_path(CATCH_UP_PAGE_SIZE, offset),
