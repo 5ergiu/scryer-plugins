@@ -381,7 +381,10 @@ fn plugin_error(error: String) -> PluginError {
             PluginErrorCode::RateLimited,
             retry_after_from_message(&error),
         )
-    } else if error.contains("required") || error.contains("missing") {
+    } else if error.contains("required")
+        || error.contains("missing")
+        || error == EMAIL_USERNAME_ERROR
+    {
         (PluginErrorCode::InvalidConfig, None)
     } else if error.contains("request failed") {
         (PluginErrorCode::UpstreamUnavailable, None)
@@ -1918,11 +1921,12 @@ fn config_required_string(key: &str) -> Result<String, String> {
     }
 }
 
+const EMAIL_USERNAME_ERROR: &str =
+    "OpenSubtitles requires the account username, not the email address";
+
 fn validate_username(username: &str) -> Result<(), String> {
     if username.contains('@') {
-        return Err(
-            "OpenSubtitles requires the account username, not the email address".to_string(),
-        );
+        return Err(EMAIL_USERNAME_ERROR.to_string());
     }
     Ok(())
 }
@@ -2062,6 +2066,12 @@ mod tests {
             error,
             "OpenSubtitles requires the account username, not the email address"
         );
+        let structured = super::plugin_error(error);
+        assert_eq!(
+            structured.code,
+            scryer_plugin_sdk::PluginErrorCode::InvalidConfig
+        );
+        assert!(structured.retry_after_seconds.is_none());
     }
 
     #[test]
