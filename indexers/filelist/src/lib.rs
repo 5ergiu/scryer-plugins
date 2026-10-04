@@ -1234,13 +1234,18 @@ struct FileListConfig {
 
 impl FileListConfig {
     fn from_host() -> Result<Self, Error> {
+        Self::from_config(|key| config::get(key).ok().flatten())
+    }
+
+    fn from_config(get: impl Fn(&str) -> Option<String>) -> Result<Self, Error> {
+        let value = |key| get(key).map(|value| value.trim().to_string());
         Self::resolve(
-            config_value("base_url"),
-            config_value("username"),
-            config_value("passkey"),
-            config_value("categories"),
-            config_value("anime_categories"),
-            config_value("movie_categories"),
+            value("base_url").filter(|value| !value.is_empty()),
+            value("username").filter(|value| !value.is_empty()),
+            value("passkey").filter(|value| !value.is_empty()),
+            value("categories"),
+            value("anime_categories"),
+            value("movie_categories"),
         )
     }
 
@@ -1337,14 +1342,6 @@ fn parse_categories(raw: &str) -> Vec<i64> {
         }
     }
     out
-}
-
-fn config_value(key: &str) -> Option<String> {
-    config::get(key)
-        .ok()
-        .flatten()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -2208,14 +2205,12 @@ mod tests {
 
     #[test]
     fn missing_facet_categories_default_for_existing_configurations() {
-        let config = FileListConfig::resolve(
-            None,
-            Some("u".to_string()),
-            Some("p".to_string()),
-            Some("23,21,27".to_string()),
-            None,
-            None,
-        )
+        let config = FileListConfig::from_config(|key| match key {
+            "username" => Some("u".to_string()),
+            "passkey" => Some("p".to_string()),
+            "categories" => Some("23,21,27".to_string()),
+            _ => None,
+        })
         .expect("legacy series-only config should gain facet defaults");
 
         assert_eq!(config.categories, vec![23, 21, 27]);
@@ -2232,18 +2227,48 @@ mod tests {
 
     #[test]
     fn explicitly_empty_facet_categories_remain_opted_out() {
-        let config = FileListConfig::resolve(
-            None,
-            Some("u".to_string()),
-            Some("p".to_string()),
-            Some("23,21,27".to_string()),
-            Some("".to_string()),
-            Some("".to_string()),
-        )
-        .expect("series categories remain configured");
+        for empty in ["", "  "] {
+            let config = FileListConfig::from_config(|key| match key {
+                "username" => Some("u".to_string()),
+                "passkey" => Some("p".to_string()),
+                "categories" => Some("23,21,27".to_string()),
+                "anime_categories" | "movie_categories" => Some(empty.to_string()),
+                _ => None,
+            })
+            .expect("series categories remain configured");
 
-        assert!(config.anime_categories.is_empty());
-        assert!(config.movie_categories.is_empty());
+            assert!(config.anime_categories.is_empty());
+            assert!(config.movie_categories.is_empty());
+            for facet in ["anime", "movie"] {
+                let mut search = request();
+                search.facet = Some(facet.to_string());
+                search.query = "Example".to_string();
+                assert!(build_request_tiers(&config, &search).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn host_config_rejects_all_empty_categories_and_blank_credentials() {
+        let error = FileListConfig::from_config(|key| match key {
+            "username" => Some("u".to_string()),
+            "passkey" => Some("p".to_string()),
+            "categories" | "anime_categories" | "movie_categories" => Some(" ".to_string()),
+            _ => None,
+        })
+        .expect_err("explicitly empty category lists must not regain defaults");
+        assert_eq!(plugin_error(&error).code, PluginErrorCode::InvalidConfig);
+
+        for credential in ["username", "passkey"] {
+            let error = FileListConfig::from_config(|key| match key {
+                key if key == credential => Some(" ".to_string()),
+                "username" => Some("u".to_string()),
+                "passkey" => Some("p".to_string()),
+                _ => None,
+            })
+            .expect_err("blank credentials remain invalid");
+            assert!(plugin_error(&error).public_message.contains(credential));
+        }
     }
 
     #[test]
