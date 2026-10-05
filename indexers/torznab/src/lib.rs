@@ -104,7 +104,6 @@ fn build_descriptor() -> PluginDescriptor {
                     raw_provider_metadata: true,
                     password_hint: true,
                     protection_hint: true,
-                    ..IndexerResponseFeatures::default()
                 }),
             },
             scoring_policies: vec![],
