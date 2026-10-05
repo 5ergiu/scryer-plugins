@@ -1,10 +1,10 @@
 [package]
 name = "animetosho-xyz-indexer"
-version = "2.4.0"
+version = "2.4.1"
 edition = "2024"
 autolib = false
 license = "GPL-3.0-only"
-description = "AnimeTosho.xyz Newznab/Torznab feed indexer"
+description = "AnimeTosho.net Newznab/Torznab feed indexer"
 
 [package.metadata.scryer]
 official = true
